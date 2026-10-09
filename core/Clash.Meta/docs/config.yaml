@@ -1801,6 +1801,17 @@ proxy-groups:
   #                   # 两种策略给出的一致性时长不同(前者永久、后者 10 分钟),
   #                   # 取舍见 PR #3133。
 
+  # smart 根据真实连接质量动态选择节点（首响应延迟、重传惩罚、按站点记忆），失败时按优选集合、健康节点、失败节点的顺序回退
+  - name: "smart-auto"
+    type: smart
+    proxies:
+      - ss1
+      - ss2
+      - vmess1
+    url: "https://cp.cloudflare.com/generate_204"
+    # policy-priority: "Premium:0.9;Backup:1.3" # 正则:系数，系数<1 提升优先级，>1 降低优先级，第一个匹配的规则生效
+    # 注意：smart 组固定每 5 分钟重新测试一轮，interval 参数无效
+
   # select 用户自行选择节点
   - name: Proxy
     type: select
