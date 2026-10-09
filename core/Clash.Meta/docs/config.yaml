@@ -1802,6 +1802,7 @@ proxy-groups:
   #                   # 取舍见 PR #3133。
 
   # smart 根据真实连接质量动态选择节点（首响应延迟、重传惩罚、按站点记忆），失败时按优选集合、健康节点、失败节点的顺序回退
+  # 重传惩罚依赖系统 TCP 计数器：macOS 与 Linux（含 Android）提供，Windows 暂缺，缺失时自动退化为仅延迟评分
   - name: "smart-auto"
     type: smart
     proxies:
