@@ -8,6 +8,7 @@ import (
 
 	"github.com/metacubex/mihomo/common/yaml"
 	"github.com/metacubex/mihomo/log"
+	yamlv3 "go.yaml.in/yaml/v3"
 )
 
 func TestPatchYamlShortID(t *testing.T) {
@@ -56,7 +57,7 @@ func TestLogHistoryCarriesTime(t *testing.T) {
 	}
 }
 
-func TestMarshalYamlKeepingSupplementary(t *testing.T) {
+func TestMarshalYamlNodeKeepingSupplementary(t *testing.T) {
 	type entry struct {
 		Name  string `yaml:"name"`
 		Value string `yaml:"value"`
@@ -67,7 +68,11 @@ func TestMarshalYamlKeepingSupplementary(t *testing.T) {
 		{`literal \U0001F680 text`, "line one\nline two 🚀\n"},
 		{"☁️ plain \ue000", "quoted \"🚀\" \\U0001F680"},
 	}
-	out, err := marshalYamlKeepingSupplementary(map[string]any{"entries": entries})
+	var root yamlv3.Node
+	if err := root.Encode(map[string]any{"entries": entries}); err != nil {
+		t.Fatal(err)
+	}
+	out, err := marshalYamlNode(&root)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,5 +88,42 @@ func TestMarshalYamlKeepingSupplementary(t *testing.T) {
 	}
 	if !reflect.DeepEqual(parsed["entries"], entries) {
 		t.Fatalf("entries changed: %#v", parsed["entries"])
+	}
+}
+
+func TestResidentRawConfigDropsProxiesAndGroups(t *testing.T) {
+	raw, err := parseProfile([]byte(`proxies:
+  - {name: a, type: ss, server: 1.1.1.1, port: 1, cipher: aes-128-gcm, password: p}
+proxy-groups:
+  - {name: g, type: select, proxies: [a]}
+proxy-providers:
+  inline: {type: inline, payload: [{name: b, type: ss, server: 1.1.1.1, port: 2, cipher: aes-128-gcm, password: p}]}
+rule-providers:
+  ads: {type: http, behavior: domain, url: https://example.com/ads.mrs, format: mrs}
+dns:
+  enable: true
+  enhanced-mode: fake-ip
+rules:
+  - GEOSITE,google,g
+  - MATCH,g
+`), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resident := residentRawConfig(raw)
+	if resident.Proxy != nil || resident.ProxyGroup != nil {
+		t.Fatalf("proxies or groups kept: %d %d", len(resident.Proxy), len(resident.ProxyGroup))
+	}
+	if len(raw.Proxy) != 1 || len(raw.ProxyGroup) != 1 {
+		t.Fatalf("source changed: %d %d", len(raw.Proxy), len(raw.ProxyGroup))
+	}
+	if !resident.DNS.Enable || len(resident.Rule) != 2 || len(resident.RuleProvider) != 1 {
+		t.Fatalf("resident lost fields: %+v", resident.DNS.Enable)
+	}
+	if _, err := marshalInlineProviderContent(resident, "inline"); err != nil {
+		t.Fatal(err)
+	}
+	if residentRawConfig(nil) != nil {
+		t.Fatal("nil config should stay nil")
 	}
 }

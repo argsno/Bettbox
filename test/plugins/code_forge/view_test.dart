@@ -6,7 +6,6 @@ import 'package:material_ui/material_ui.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:re_highlight/languages/yaml.dart';
 import 'package:re_highlight/styles/atom-one-light.dart';
 
 import 'support.dart';
@@ -346,7 +345,7 @@ void _caretScroll() {
         home: Scaffold(
           body: CodeForge(
             controller: controller,
-            language: langYaml,
+            language: editorYamlMode,
             editorTheme: atomOneLightTheme,
             textStyle: const TextStyle(
               fontSize: 16,
@@ -457,6 +456,33 @@ void _caretScroll() {
       horizontal.position.maxScrollExtent,
       greaterThanOrEqualTo(_gutterWidth + 100 * _glyphWidth - 400),
     );
+  });
+
+  testWidgets('reaching the end of a long wrapped text keeps its extent', (
+    tester,
+  ) async {
+    late ScrollController vertical;
+    final controller = CodeForgeController()
+      ..text = [
+        for (var i = 0; i < 1000; i++) i < 900 ? 'a' : 'b' * 100,
+      ].join('\n');
+    await pumpEditor(
+      tester,
+      controller,
+      lineWrap: true,
+      size: const Size(400, 300),
+      scrollbarBuilder: (_, details, child) {
+        vertical = details.controller;
+        return child;
+      },
+    );
+    final extent = vertical.position.maxScrollExtent;
+
+    vertical.jumpTo(extent);
+    await settle(tester, 2);
+
+    expect(vertical.position.maxScrollExtent, extent);
+    expect(vertical.offset, extent);
   });
 }
 
@@ -2120,7 +2146,7 @@ void _painting() {
 
   SyntaxHighlighter yamlHighlighter() {
     final highlighter = SyntaxHighlighter(
-      language: langYaml,
+      language: editorYamlMode,
       editorTheme: atomOneLightTheme,
     );
     addTearDown(highlighter.dispose);

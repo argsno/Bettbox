@@ -9,7 +9,6 @@ import 'package:bett_box/plugins/app.dart';
 import 'package:bett_box/providers/providers.dart';
 import 'package:bett_box/state.dart';
 import 'package:bett_box/views/tools.dart';
-import 'package:flutter/foundation.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -75,6 +74,12 @@ class _AppStateManagerState extends ConsumerState<AppStateManager>
         globalState.appController.savePreferencesDebounce();
       }
     });
+    ref.listenManual(profilesProvider, (prev, next) {
+      if (prev == null) return;
+      globalState.appController.syncBundles(prev, next);
+      if (!next.hasAddedOrChanged(prev)) return;
+      globalState.appController.autoBackupDebounce();
+    });
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _updateDashboardRefreshState();
       detectionState.tryStartCheck();
@@ -84,12 +89,11 @@ class _AppStateManagerState extends ConsumerState<AppStateManager>
     if (window == null) {
       return;
     }
-    ref.listenManual(autoSetSystemDnsStateProvider, (prev, next) async {
+    ref.listenManual(systemDnsTakeoverProvider, (prev, next) async {
       if (prev == next) {
         return;
       }
-      final shouldSet = next.a == true && next.b == true;
-      await macOS?.updateDns(!shouldSet);
+      await system.updateDns(!next);
     });
     ref.listenManual(currentBrightnessProvider, (prev, next) {
       if (prev == next) {
@@ -191,6 +195,7 @@ class _AppStateManagerState extends ConsumerState<AppStateManager>
       await globalState.resumeForegroundUpdates();
       await globalState.appController.syncWakelockIfNeeded();
       _scheduleMissedUpdateCheck();
+      unawaited(globalState.appController.flushAutoBackup());
       try {
         final isInit = await clashCore.isInit;
         if (isInit) {
@@ -222,33 +227,6 @@ class _AppStateManagerState extends ConsumerState<AppStateManager>
   @override
   Widget build(BuildContext context) {
     return widget.child;
-  }
-}
-
-class AppEnvManager extends StatelessWidget {
-  final Widget child;
-
-  const AppEnvManager({super.key, required this.child});
-
-  @override
-  Widget build(BuildContext context) {
-    if (kDebugMode) {
-      if (globalState.isPre) {
-        return Banner(
-          message: 'DEBUG',
-          location: BannerLocation.topEnd,
-          child: child,
-        );
-      }
-    }
-    if (globalState.isPre) {
-      return Banner(
-        message: 'PRE',
-        location: BannerLocation.topEnd,
-        child: child,
-      );
-    }
-    return child;
   }
 }
 
@@ -439,6 +417,14 @@ class _SidebarOverlayState extends State<_SidebarOverlay> {
   }
 
   @override
+  void dispose() {
+    _entry
+      ..remove()
+      ..dispose();
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
     return Overlay(initialEntries: [_entry]);
   }
@@ -496,7 +482,7 @@ class AppSidebarContainer extends ConsumerWidget {
     List<NavigationItem> items,
   ) {
     if (items.isEmpty) return _sidebarExpandedWidth;
-    final labels = items.map((item) => item.label.localizedName).join('\n');
+    final labels = items.map((item) => _sidebarLabelOf(item.label)).join('\n');
     final scaler =
         MediaQuery.maybeTextScalerOf(context) ?? TextScaler.noScaling;
     final fontFamily = context.textTheme.labelLarge?.fontFamily;
@@ -528,7 +514,7 @@ class AppSidebarContainer extends ConsumerWidget {
     double maxTextWidth = 0.0;
     for (final item in items) {
       final painter = TextPainter(
-        text: TextSpan(text: item.label.localizedName, style: textStyle),
+        text: TextSpan(text: _sidebarLabelOf(item.label), style: textStyle),
         textDirection: direction,
         textScaler: textScaler,
         maxLines: 1,
@@ -546,7 +532,7 @@ class AppSidebarContainer extends ConsumerWidget {
         ? 132.0
         : requiredWidth <= 136.0
         ? 148.0
-        : 156.0;
+        : math.max(156.0, (requiredWidth + 8.0).ceilToDouble());
     if (system.isMacOS) return itemsWidth;
     final brandPainter = TextPainter(
       text: TextSpan(
@@ -718,10 +704,44 @@ class AppSidebarContainer extends ConsumerWidget {
         .updateState(
           (state) => state.copyWith(sidebarCollapsed: !state.sidebarCollapsed),
         );
+    final hasBottomItem =
+        navigationItems.isNotEmpty &&
+        navigationItems.last.label == PageLabel.tools;
+    Widget buildItem(int index) {
+      final item = navigationItems[index];
+      final isTools = item.label == PageLabel.tools;
+      final isSelected = currentIndex == index;
+      final hasFlyout =
+          sidebarFlyout &&
+          isTools &&
+          !(sidebarFlyoutOutsideTools && isSelected);
+      final sidebarItem = _SidebarItem(
+        icon: isTools ? const Icon(Icons.settings) : item.icon,
+        label: _sidebarLabelOf(item.label),
+        isSelected: isSelected,
+        isCollapsed: isCollapsed,
+        hasTooltip: !hasFlyout && !isSelected,
+        expandedWidth: expandedWidth,
+        onTap: () {
+          if (currentIndex == index) {
+            final pageContext = GlobalObjectKey(item.label).currentContext;
+            if (pageContext != null) {
+              Navigator.of(pageContext).popUntil((route) => route.isFirst);
+            }
+          }
+          globalState.appController.toPage(item.label);
+        },
+      );
+      if (!hasFlyout) {
+        return sidebarItem;
+      }
+      return _SidebarFlyout(
+        title: _sidebarLabelOf(item.label),
+        child: sidebarItem,
+      );
+    }
+
     final isLight = context.colorScheme.brightness == Brightness.light;
-    final pureBlack = ref.watch(
-      themeSettingProvider.select((s) => s.pureBlack),
-    );
     final washColor = context.colorScheme.surfaceContainer;
     final baseColor = isLight
         ? Color.lerp(
@@ -729,13 +749,11 @@ class AppSidebarContainer extends ConsumerWidget {
             context.colorScheme.surfaceContainerLowest,
             0.85,
           )!
-        : (pureBlack
-              ? washColor
-              : Color.lerp(
-                  washColor,
-                  context.colorScheme.surfaceContainerHigh,
-                  0.35,
-                )!);
+        : Color.lerp(
+            washColor,
+            context.colorScheme.surfaceContainerHigh,
+            0.35,
+          )!;
     return _SidebarOverlay(
       child: _WashBackground(
         baseColor: baseColor,
@@ -803,57 +821,28 @@ class AppSidebarContainer extends ConsumerWidget {
                                             horizontal: 9,
                                             vertical: 4,
                                           ),
-                                          itemCount: navigationItems.length,
+                                          itemCount: hasBottomItem
+                                              ? navigationItems.length - 1
+                                              : navigationItems.length,
                                           separatorBuilder: (_, _) =>
                                               const SizedBox(height: 3.5),
-                                          itemBuilder: (context, index) {
-                                            final item = navigationItems[index];
-                                            final isSelected =
-                                                currentIndex == index;
-                                            final hasFlyout =
-                                                sidebarFlyout &&
-                                                item.label == PageLabel.tools &&
-                                                !(sidebarFlyoutOutsideTools &&
-                                                    isSelected);
-                                            final sidebarItem = _SidebarItem(
-                                              icon: item.icon,
-                                              label: item.label.localizedName,
-                                              isSelected: isSelected,
-                                              isCollapsed: isCollapsed,
-                                              hasTooltip:
-                                                  !hasFlyout && !isSelected,
-                                              expandedWidth: expandedWidth,
-                                              onTap: () {
-                                                if (currentIndex == index) {
-                                                  final pageContext =
-                                                      GlobalObjectKey(
-                                                        item.label,
-                                                      ).currentContext;
-                                                  if (pageContext != null) {
-                                                    Navigator.of(
-                                                      pageContext,
-                                                    ).popUntil(
-                                                      (route) => route.isFirst,
-                                                    );
-                                                  }
-                                                }
-                                                globalState.appController
-                                                    .toPage(item.label);
-                                              },
-                                            );
-                                            if (!hasFlyout) {
-                                              return sidebarItem;
-                                            }
-                                            return _SidebarFlyout(
-                                              title: item.label.localizedName,
-                                              child: sidebarItem,
-                                            );
-                                          },
+                                          itemBuilder: (_, index) =>
+                                              buildItem(index),
                                         ),
                                       ),
                                     ),
                                   ),
                                 ),
+                                if (hasBottomItem)
+                                  Padding(
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 9,
+                                      vertical: 4,
+                                    ),
+                                    child: buildItem(
+                                      navigationItems.length - 1,
+                                    ),
+                                  ),
                                 const SizedBox(height: 8),
                               ],
                             ),
@@ -909,6 +898,9 @@ class AppSidebarContainer extends ConsumerWidget {
     );
   }
 }
+
+String _sidebarLabelOf(PageLabel label) =>
+    label == PageLabel.tools ? appLocalizations.settings : label.localizedName;
 
 class _SidebarItem extends StatefulWidget {
   final Widget icon;
@@ -1167,7 +1159,6 @@ class _SidebarFlyoutState extends ConsumerState<_SidebarFlyout>
   Widget _buildPanel(
     BuildContext context,
     List<ToolsShortcut> shortcuts,
-    bool pureBlack,
   ) {
     final itemBox = this.context.findRenderObject();
     final overlayBox = Overlay.of(this.context).context.findRenderObject();
@@ -1199,14 +1190,14 @@ class _SidebarFlyoutState extends ConsumerState<_SidebarFlyout>
                 end: Offset.zero,
               ).animate(_animation),
               child: Material(
-                color: isLight || pureBlack
+                color: isLight
                     ? colorScheme.surfaceContainerLow
                     : colorScheme.surfaceContainerHighest,
                 elevation: 6,
                 shadowColor: Colors.black.withValues(
                   alpha: isLight ? 0.35 : 0.6,
                 ),
-                shape: RoundedRectangleBorder(
+                shape: RoundedSuperellipseBorder(
                   borderRadius: BorderRadius.circular(16),
                   side: BorderSide(
                     color: colorScheme.outlineVariant.withValues(
@@ -1259,13 +1250,9 @@ class _SidebarFlyoutState extends ConsumerState<_SidebarFlyout>
       appSettingProvider.select((state) => state.sidebarFlyoutEntries),
     );
     final shortcuts = getToolsShortcuts(moreItems, entries);
-    final pureBlack = ref.watch(
-      themeSettingProvider.select((state) => state.pureBlack),
-    );
     return OverlayPortal(
       controller: _portalController,
-      overlayChildBuilder: (context) =>
-          _buildPanel(context, shortcuts, pureBlack),
+      overlayChildBuilder: (context) => _buildPanel(context, shortcuts),
       child: MouseRegion(
         onEnter: (_) => _handleEnter(),
         onExit: (_) => _handleExit(),

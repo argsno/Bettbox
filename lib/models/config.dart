@@ -45,7 +45,7 @@ const defaultNetworkProps = NetworkProps();
 const defaultProxiesStyle = ProxiesStyle();
 const defaultWindowProps = WindowProps();
 const defaultAccessControl = AccessControl();
-final defaultThemeProps = ThemeProps(primaryColor: defaultPrimaryColor);
+const defaultThemeProps = ThemeProps();
 
 const List<DashboardWidget> defaultDashboardWidgets = [
   DashboardWidget.networkSpeed,
@@ -70,52 +70,47 @@ const List<DashboardWidget> defaultAndroidDashboardWidgets = [
   DashboardWidget.startButton,
 ];
 
+final _dashboardWidgetNames = {
+  for (final entry in _$DashboardWidgetEnumMap.entries) entry.value: entry.key,
+};
+
+List<DashboardWidget> _decodeDashboardWidgets(List<dynamic> values) => [
+  for (final value in values) ?_dashboardWidgetNames[value],
+];
+
 List<DashboardWidget> dashboardWidgetsSafeFromJson(
   List<dynamic>? dashboardWidgets,
 ) {
-  try {
-    return dashboardWidgets
-            ?.map((e) => $enumDecode(_$DashboardWidgetEnumMap, e))
-            .toList() ??
-        (system.isAndroid
-            ? defaultAndroidDashboardWidgets
-            : defaultDashboardWidgets);
-  } catch (_) {
+  if (dashboardWidgets == null) {
     return system.isAndroid
         ? defaultAndroidDashboardWidgets
         : defaultDashboardWidgets;
   }
+  return _decodeDashboardWidgets(dashboardWidgets);
 }
 
 List<DashboardWidget> mobileDashboardWidgetsSafeFromJson(
   List<dynamic>? dashboardWidgets,
 ) {
-  try {
-    return dashboardWidgets
-            ?.map((e) => $enumDecode(_$DashboardWidgetEnumMap, e))
-            .toList() ??
-        defaultAndroidDashboardWidgets;
-  } catch (_) {
+  if (dashboardWidgets == null) {
     return defaultAndroidDashboardWidgets;
   }
+  return _decodeDashboardWidgets(dashboardWidgets);
 }
 
 List<DashboardWidget> desktopDashboardWidgetsSafeFromJson(
   List<dynamic>? dashboardWidgets,
 ) {
-  try {
-    return dashboardWidgets
-            ?.map((e) => $enumDecode(_$DashboardWidgetEnumMap, e))
-            .toList() ??
-        defaultDashboardWidgets;
-  } catch (_) {
+  if (dashboardWidgets == null) {
     return defaultDashboardWidgets;
   }
+  return _decodeDashboardWidgets(dashboardWidgets);
 }
 
 const List<SidebarFlyoutEntry> defaultSidebarFlyoutEntries = [
   SidebarFlyoutEntry.resources,
   SidebarFlyoutEntry.script,
+  SidebarFlyoutEntry.toolbox,
   SidebarFlyoutEntry.theme,
   SidebarFlyoutEntry.basicConfig,
   SidebarFlyoutEntry.otherSettings,
@@ -204,7 +199,6 @@ abstract class AppSettingProps with _$AppSettingProps {
     @Default(true) bool openLogs,
     @Default(true) bool closeConnections,
     @Default(true) bool logAiSearch,
-    @Default(false) bool flushDnsOnNetworkChange,
     @Default(defaultTestUrl) String testUrl,
     @Default(true) bool showStartSwitch,
     @Default(StartSwitchStyle.outlined) StartSwitchStyle startSwitchStyle,
@@ -219,15 +213,28 @@ abstract class AppSettingProps with _$AppSettingProps {
     @Default(true) bool keepDockIcon,
     @Default(false) bool developerMode,
     @Default(RecoveryStrategy.compatible) RecoveryStrategy recoveryStrategy,
+    @Default('') String backupPassword,
     @Default(false) bool enableHighPriority,
-    @Default(false) bool sidebarCollapsed,
-    @Default(true) bool sidebarFlyout,
+    @Default(true) bool sidebarCollapsed,
+    @Default(false) bool sidebarFlyout,
     @Default(false) bool sidebarFlyoutOutsideTools,
     @Default(SidebarFlyoutDelay.standard) SidebarFlyoutDelay sidebarFlyoutDelay,
     @Default(defaultSidebarFlyoutEntries)
     @JsonKey(fromJson: sidebarFlyoutEntriesSafeFromJson)
     List<SidebarFlyoutEntry> sidebarFlyoutEntries,
     String? dashboardTitle,
+    @Default(false) bool dashboardWatermark,
+    @Default(<String>[]) List<String> toolboxTiles,
+    @JsonKey(unknownEnumValue: MrsTapAction.viewRules)
+    @Default(MrsTapAction.viewRules)
+    MrsTapAction mrsTapAction,
+    @Default(true) bool mrsResolveDns,
+    @Default(false) bool ipRiskDetail,
+    @Default(true) bool ipRiskAlert,
+    @Default(IperfOptions()) IperfOptions iperfOptions,
+    @Default(LocalPingOptions()) LocalPingOptions localPingOptions,
+    @Default(<String, String>{}) Map<String, String> mobileDashboardSizes,
+    @Default(<String, String>{}) Map<String, String> desktopDashboardSizes,
   }) = _AppSettingProps;
 
   factory AppSettingProps.fromJson(Map<String, Object?> json) =>
@@ -316,7 +323,6 @@ abstract class VpnProps with _$VpnProps {
     @Default(false) bool disableQuic,
     @Default(false) bool highPriorityNotification,
     @Default(false) bool networkSpeedNotification,
-    @Default(false) bool excludeChina,
     @Default(false) bool trayEnhancement,
     @Default(TrayClickBehavior.showPanel)
     TrayClickBehavior trayLeftClickBehavior,
@@ -348,6 +354,11 @@ List<String> bypassDomainSafeFromJson(List<dynamic>? bypassDomain) {
   }
 }
 
+int concurrencyLimitFromJson(Object? value) {
+  if (value is! int || value > 32) return maxDelayTestConcurrency;
+  return value < 1 ? 1 : value;
+}
+
 @freezed
 abstract class NetworkProps with _$NetworkProps {
   const factory NetworkProps({
@@ -357,7 +368,7 @@ abstract class NetworkProps with _$NetworkProps {
     List<String> bypassDomain,
     @Default(true) bool bypassPrivateRoute,
     @Default([]) List<String> bypassPrivateRouteAddress,
-    @Default(true) bool autoSetSystemDns,
+    @Default(ProfileSwitchMode.hotReload) ProfileSwitchMode profileSwitchMode,
   }) = _NetworkProps;
 
   factory NetworkProps.fromJson(Map<String, Object?>? json) =>
@@ -380,13 +391,16 @@ abstract class ProxiesStyle with _$ProxiesStyle {
     @Default(ProxiesSortType.none) ProxiesSortType sortType,
     @Default(ProxiesLayout.standard) ProxiesLayout layout,
     @Default(ProxiesIconStyle.none) ProxiesIconStyle iconStyle,
-    @Default(ProxyCardType.shrink) ProxyCardType cardType,
-    @Default(DelayAnimationType.none) DelayAnimationType delayAnimation,
+    @Default(ProxyCardType.expand) ProxyCardType cardType,
+    @Default(DelayAnimationType.pulse) DelayAnimationType delayAnimation,
     @Default(true) bool syncDelayAnimation,
     @Default({}) Map<String, String> iconMap,
-    @Default(250) int concurrencyLimit,
-    @Default(true) bool autoStickyHeader,
+    @Default(maxDelayTestConcurrency)
+    @JsonKey(fromJson: concurrencyLimitFromJson)
+    int concurrencyLimit,
+    @Default(false) bool autoStickyHeader,
     @Default(false) bool showHiddenItems,
+    @Default(false) bool hideTimeoutProxies,
     @Default(false) bool hasCustomizedStyle,
   }) = _ProxiesStyle;
 
@@ -412,7 +426,6 @@ abstract class ThemeProps with _$ThemeProps {
     @Default(defaultPrimaryColors) List<int> primaryColors,
     @Default(ThemeMode.system) ThemeMode themeMode,
     @Default(DynamicSchemeVariant.content) DynamicSchemeVariant schemeVariant,
-    @Default(false) bool pureBlack,
     @Default(TextScale()) TextScale textScale,
     @Default(false) bool useDarkIcon,
     @Default(false) bool useHarmonyFont,
@@ -436,31 +449,18 @@ abstract class ThemeProps with _$ThemeProps {
 
 @freezed
 abstract class ScriptProps with _$ScriptProps {
-  const factory ScriptProps({
-    String? currentId,
-    @Default([]) List<Script> scripts,
-  }) = _ScriptProps;
+  const factory ScriptProps({@Default([]) List<Script> scripts}) = _ScriptProps;
 
   factory ScriptProps.fromJson(Map<String, Object?> json) =>
       _$ScriptPropsFromJson(json);
 }
 
 extension ScriptPropsExt on ScriptProps {
-  String? get realId {
-    final index = scripts.indexWhere((script) => script.id == currentId);
-    if (index != -1) {
-      return currentId;
-    }
-    return null;
-  }
+  Script? findScript(String? id) =>
+      scripts.where((script) => script.id == id).firstOrNull;
 
-  Script? get currentScript {
-    final index = scripts.indexWhere((script) => script.id == currentId);
-    if (index != -1) {
-      return scripts[index];
-    }
-    return null;
-  }
+  Script? scriptOf(Profile profile) =>
+      profile.isManaged ? null : findScript(profile.scriptId);
 
   Future<ScriptProps> externalize() async {
     if (scripts.every((script) => script.content.isEmpty)) return this;
@@ -482,6 +482,48 @@ extension ScriptPropsExt on ScriptProps {
 }
 
 @freezed
+abstract class CustomRoute with _$CustomRoute {
+  const factory CustomRoute({
+    required String id,
+    required String name,
+    String? icon,
+    @Default([]) List<String> sets,
+    String? target,
+    @Default(true) bool enabled,
+  }) = _CustomRoute;
+
+  factory CustomRoute.fromJson(Map<String, Object?> json) =>
+      _$CustomRouteFromJson(json);
+}
+
+@freezed
+abstract class CustomRegion with _$CustomRegion {
+  const factory CustomRegion({
+    required String name,
+    required String regex,
+  }) = _CustomRegion;
+
+  factory CustomRegion.fromJson(Map<String, Object?> json) =>
+      _$CustomRegionFromJson(json);
+}
+
+@freezed
+abstract class ManagedProps with _$ManagedProps {
+  const factory ManagedProps({
+    @Default({}) Map<String, bool> options,
+    String? syncedVersion,
+    @Default([]) List<CustomRoute> routes,
+    @Default([]) List<String> order,
+    @Default([]) List<String> removed,
+    List<String>? regions,
+    @Default([]) List<CustomRegion> customRegions,
+  }) = _ManagedProps;
+
+  factory ManagedProps.fromJson(Map<String, Object?> json) =>
+      _$ManagedPropsFromJson(json);
+}
+
+@freezed
 abstract class Config with _$Config {
   const factory Config({
     @JsonKey(fromJson: AppSettingProps.safeFromJson)
@@ -490,12 +532,10 @@ abstract class Config with _$Config {
     @Default([]) List<Profile> profiles,
     @Default([]) List<HotKeyAction> hotKeyActions,
     String? currentProfileId,
-    @Default(false) bool overrideDns,
     @Default(false) bool overrideNtp,
     @Default(false) bool overrideSniffer,
     @Default(false) bool overrideTunnel,
     @Default(false) bool overrideExperimental,
-    @Default(true) bool overrideTestUrl,
     DAV? dav,
     @Default(defaultNetworkProps) NetworkProps networkProps,
     @JsonKey(fromJson: VpnProps.safeFromJson)
@@ -503,11 +543,13 @@ abstract class Config with _$Config {
     VpnProps vpnProps,
     @JsonKey(fromJson: ThemeProps.safeFromJson) required ThemeProps themeProps,
     @Default(defaultProxiesStyle) ProxiesStyle proxiesStyle,
+    @Default(defaultTrafficStatsProps) TrafficStatsProps trafficStatsProps,
     @Default(defaultWindowProps) WindowProps windowProps,
     @JsonKey(fromJson: ClashConfig.safeFormJson)
     @Default(defaultClashConfig)
     ClashConfig patchClashConfig,
     @Default(ScriptProps()) ScriptProps scriptProps,
+    @Default(ManagedProps()) ManagedProps managedProps,
     @Default('') String nodeExcludeFilter,
     @Default(5000) int healthCheckTimeout,
   }) = _Config;
@@ -562,6 +604,24 @@ abstract class Config with _$Config {
             if (id != null && id is int) {
               profile['id'] = id.toString();
             }
+          }
+        }
+      }
+    } catch (_) {}
+
+    try {
+      final scriptProps = json['scriptProps'];
+      final profiles = json['profiles'];
+      if (scriptProps is Map && profiles is List) {
+        final currentId = scriptProps.remove('currentId');
+        for (final profile in profiles) {
+          if (profile is! Map) continue;
+          final enabled = profile.remove('useScriptOverride') != false;
+          if (currentId is String &&
+              enabled &&
+              profile['scriptId'] == null &&
+              profile['bundle'] == null) {
+            profile['scriptId'] = currentId;
           }
         }
       }

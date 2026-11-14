@@ -244,9 +244,7 @@ class _ResourcesViewState extends ConsumerState<ResourcesView> {
       body: ScrollEdgeRise(
         builder: (context, rise) => ListView(
           padding: EdgeInsets.only(
-            bottom:
-                (globalState.isAndroidTV ? 48.0 : 16.0) +
-                MediaQuery.of(context).padding.bottom,
+            bottom: 16.0 + MediaQuery.paddingOf(context).bottom,
             top: 8 + rise,
           ),
           children: [
@@ -258,6 +256,11 @@ class _ResourcesViewState extends ConsumerState<ResourcesView> {
                 top: 4,
                 bottom: 8,
               ),
+              actions: [
+                if (Theme.of(context).materialTapTargetSize ==
+                    MaterialTapTargetSize.padded)
+                  const SizedBox(height: kMinInteractiveDimension),
+              ],
             ),
             ...generateSection(
               items: geoItems.map(
@@ -284,12 +287,17 @@ class _GeoDataListItemState extends ConsumerState<GeoDataListItem> {
   GeoItem get geoItem => widget.geoItem;
 
   Future<void> _updateUrl(String url) async {
-    final defaultMap = defaultGeoXUrl.toJson();
+    final defaultValue = switch (geoItem.key) {
+      'mmdb' => defaultGeoXUrl.mmdb,
+      'asn' => defaultGeoXUrl.asn,
+      'geosite' => defaultGeoXUrl.geosite,
+      _ => null,
+    };
     final newUrl = await globalState.showCommonDialog<String>(
       child: UpdateGeoUrlFormDialog(
         title: geoItem.label,
         url: url,
-        defaultValue: defaultMap[geoItem.key],
+        defaultValue: defaultValue,
       ),
     );
     if (newUrl != null && newUrl != url && mounted) {
@@ -298,9 +306,13 @@ class _GeoDataListItemState extends ConsumerState<GeoDataListItem> {
           throw 'Invalid url';
         }
         ref.read(patchClashConfigProvider.notifier).updateState((state) {
-          final map = state.geoXUrl.toJson();
-          map[geoItem.key] = newUrl;
-          return state.copyWith(geoXUrl: GeoXUrl.fromJson(map));
+          final geoXUrl = switch (geoItem.key) {
+            'mmdb' => state.geoXUrl.copyWith(mmdb: newUrl),
+            'asn' => state.geoXUrl.copyWith(asn: newUrl),
+            'geosite' => state.geoXUrl.copyWith(geosite: newUrl),
+            _ => state.geoXUrl,
+          };
+          return state.copyWith(geoXUrl: geoXUrl);
         });
         await globalState.appController.setupClashConfig();
       } catch (e) {
@@ -360,7 +372,12 @@ class _GeoDataListItemState extends ConsumerState<GeoDataListItem> {
 
     final url = ref.watch(
       patchClashConfigProvider.select(
-        (state) => state.geoXUrl.toJson()[geoItem.key],
+        (state) => switch (geoItem.key) {
+          'mmdb' => state.geoXUrl.mmdb,
+          'asn' => state.geoXUrl.asn,
+          'geosite' => state.geoXUrl.geosite,
+          _ => null,
+        },
       ),
     );
     final isSyncing = ref.watch(
@@ -411,7 +428,9 @@ class _GeoDataListItemState extends ConsumerState<GeoDataListItem> {
                       CommonChip(
                         avatar: const Icon(Icons.edit),
                         label: appLocalizations.edit,
-                        onPressed: isSyncing ? null : () => _updateUrl(url),
+                        onPressed: isSyncing || url == null
+                            ? null
+                            : () => _updateUrl(url),
                       ),
                       Row(
                         mainAxisSize: MainAxisSize.min,
@@ -467,6 +486,12 @@ class _UpdateGeoUrlFormDialogState extends State<UpdateGeoUrlFormDialog> {
   void initState() {
     super.initState();
     urlController = TextEditingController(text: widget.url);
+  }
+
+  @override
+  void dispose() {
+    urlController.dispose();
+    super.dispose();
   }
 
   Future<void> _handleReset() async {

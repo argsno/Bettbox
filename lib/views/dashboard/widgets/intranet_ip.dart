@@ -1,22 +1,162 @@
 import 'package:bett_box/common/common.dart';
+import 'package:bett_box/enum/enum.dart';
 import 'package:bett_box/providers/app.dart';
 import 'package:bett_box/providers/config.dart';
 import 'package:bett_box/state.dart';
-import 'package:bett_box/views/config/general.dart';
 import 'package:bett_box/widgets/widgets.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import 'tile.dart';
+
 class IntranetIP extends StatelessWidget {
-  const IntranetIP({super.key});
+  final DashboardTileSize? size;
+
+  const IntranetIP({super.key, this.size});
 
   void _showMoreIpInfoDialog(BuildContext context) {
-    globalState.showCommonDialog(child: const _IntranetIpInfoDialog());
+    globalState.showAdaptiveSheet(child: const _IntranetIpInfoDialog());
+  }
+
+  Widget _buildItem(BuildContext context, String label, String value) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Text(
+          label,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: context.textTheme.labelSmall?.copyWith(
+            color: context.colorScheme.onSurfaceVariant,
+          ),
+        ),
+        Text(
+          value.isEmpty ? '—' : value,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: context.textTheme.bodyMedium?.toLight,
+        ),
+      ],
+    );
+  }
+
+  Widget _buildTile(BuildContext context, DashboardTileSize size) {
+    final isTall = size == DashboardTileSize.tall;
+    return Consumer(
+      builder: (_, ref, _) {
+        final info = ref.watch(localNetworkProvider);
+        final ip = info == null
+            ? '…'
+            : info.ip.isEmpty
+            ? appLocalizations.noNetwork
+            : info.ip;
+        final local = [
+          appLocalizations.natLocalIp,
+          if (info?.type.isNotEmpty ?? false) info?.type,
+        ].join(' · ');
+        final gateway = info?.gateway ?? '';
+        return DashboardTileCard(
+          size: size,
+          info: Info(
+            label: appLocalizations.intranetIP,
+            iconData: Icons.devices,
+          ),
+          mark: DashboardDecor.icon(context, Icons.devices, 80),
+          markBottom: isTall,
+          markAngle: isTall ? 0.3 : -0.3,
+          onPressed: () => _showMoreIpInfoDialog(context),
+          child: isTall
+              ? Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 8, 12, 0),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      for (final item in [
+                        _buildItem(context, local, ip),
+                        _buildItem(
+                          context,
+                          appLocalizations.defaultGateway,
+                          gateway,
+                        ),
+                        _buildItem(
+                          context,
+                          appLocalizations.systemDns,
+                          info?.dns.firstOrNull ?? '',
+                        ),
+                      ])
+                        Padding(
+                          padding: const EdgeInsets.only(bottom: 6),
+                          child: item,
+                        ),
+                    ],
+                  ),
+                )
+              : Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 0, 48, 10),
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.end,
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        crossAxisAlignment: CrossAxisAlignment.baseline,
+                        textBaseline: TextBaseline.alphabetic,
+                        children: [
+                          if (info?.type.isNotEmpty ?? false) ...[
+                            Text(
+                              info?.type ?? '',
+                              maxLines: 1,
+                              style: context.textTheme.bodySmall?.copyWith(
+                                color: context.colorScheme.onSurfaceVariant,
+                              ),
+                            ),
+                            const SizedBox(width: 8),
+                          ],
+                          Flexible(
+                            child: FittedBox(
+                              fit: BoxFit.scaleDown,
+                              alignment: AlignmentDirectional.centerStart,
+                              child: Text(
+                                ip,
+                                maxLines: 1,
+                                style: context.textTheme.titleMedium?.copyWith(
+                                  fontWeight: FontWeight.w600,
+                                  height: 1.2,
+                                  fontFeatures: const [
+                                    FontFeature.tabularFigures(),
+                                  ],
+                                ),
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                      Text(
+                        [
+                          if (gateway.isNotEmpty)
+                            '${appLocalizations.defaultGateway} $gateway',
+                          if (info?.dns.firstOrNull case final dns?)
+                            '${appLocalizations.systemDns} $dns',
+                        ].join(' · '),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: context.textTheme.bodySmall?.copyWith(
+                          color: context.colorScheme.onSurfaceVariant,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+        );
+      },
+    );
   }
 
   @override
   Widget build(BuildContext context) {
+    final size = this.size;
+    if (size != null) return _buildTile(context, size);
     return SizedBox(
       height: getWidgetHeight(context, 1),
       child: CommonCard(
@@ -84,20 +224,6 @@ class _IntranetIpInfoDialogState extends ConsumerState<_IntranetIpInfoDialog> {
     globalState.appController.updateLocalNetwork(silent: true);
   }
 
-  void _openLanSettings(BuildContext context) {
-    final targetContext = globalState.navigatorKey.currentContext ?? context;
-    Navigator.of(context, rootNavigator: true).pop();
-    showExtend(
-      targetContext,
-      builder: (_, type) => AdaptiveSheetScaffold(
-        type: type,
-        title: appLocalizations.general,
-        body: const GeneralListView(),
-      ),
-      props: const ExtendProps(blur: false, forceFull: true),
-    );
-  }
-
   Widget _buildSectionHeader(String title, {bool isFirst = false}) {
     return Padding(
       padding: EdgeInsets.only(top: isFirst ? 2 : 14, bottom: 8),
@@ -122,10 +248,7 @@ class _IntranetIpInfoDialogState extends ConsumerState<_IntranetIpInfoDialog> {
   }) {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-      decoration: BoxDecoration(
-        color: context.colorScheme.surfaceContainerLow,
-        borderRadius: BorderRadius.circular(12),
-      ),
+      decoration: panelTileDecoration(context),
       child: Row(
         children: [
           Container(
@@ -180,10 +303,7 @@ class _IntranetIpInfoDialogState extends ConsumerState<_IntranetIpInfoDialog> {
   Widget _buildLanSharingTile(bool allowLan) {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-      decoration: BoxDecoration(
-        color: context.colorScheme.surfaceContainerLow,
-        borderRadius: BorderRadius.circular(12),
-      ),
+      decoration: panelTileDecoration(context),
       child: Row(
         children: [
           Container(
@@ -211,59 +331,12 @@ class _IntranetIpInfoDialogState extends ConsumerState<_IntranetIpInfoDialog> {
               overflow: TextOverflow.ellipsis,
             ),
           ),
-          Material(
-            color: Colors.transparent,
-            child: InkWell(
-              borderRadius: BorderRadius.circular(12),
-              onTap: () => _openLanSettings(context),
-              child: Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Container(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 8,
-                        vertical: 3,
-                      ),
-                      decoration: BoxDecoration(
-                        color: allowLan
-                            ? context.colorScheme.primaryContainer
-                            : context.colorScheme.surfaceContainerHighest
-                                  .withValues(alpha: 0.5),
-                        borderRadius: BorderRadius.circular(12),
-                        border: allowLan
-                            ? null
-                            : Border.all(
-                                color: context.colorScheme.outlineVariant
-                                    .withValues(alpha: 0.5),
-                              ),
-                      ),
-                      child: Text(
-                        allowLan
-                            ? appLocalizations.enabled
-                            : appLocalizations.disabled,
-                        style: context.textTheme.labelSmall?.copyWith(
-                          color: allowLan
-                              ? context.colorScheme.onPrimaryContainer
-                              : context.colorScheme.onSurfaceVariant,
-                          fontWeight: FontWeight.w600,
-                          fontSize: 11,
-                        ),
-                      ),
-                    ),
-                    const SizedBox(width: 2),
-                    Icon(
-                      Icons.chevron_right_rounded,
-                      size: 18,
-                      color: context.colorScheme.onSurfaceVariant.withValues(
-                        alpha: 0.7,
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ),
+          Switch(
+            materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+            value: allowLan,
+            onChanged: (value) => ref
+                .read(patchClashConfigProvider.notifier)
+                .updateState((state) => state.copyWith(allowLan: value)),
           ),
         ],
       ),
@@ -362,14 +435,16 @@ class _IntranetIpInfoDialogState extends ConsumerState<_IntranetIpInfoDialog> {
     return CommonDialog(
       title: appLocalizations.moreIpInfo,
       padding: const EdgeInsets.fromLTRB(16, 14, 16, 8),
-      actions: [
-        TextButton(
-          onPressed: () {
-            Navigator.of(context, rootNavigator: true).pop();
-          },
-          child: Text(appLocalizations.confirm),
-        ),
-      ],
+      actions: isInBottomSheet(context)
+          ? null
+          : [
+              TextButton(
+                onPressed: () {
+                  Navigator.of(context, rootNavigator: true).pop();
+                },
+                child: Text(appLocalizations.confirm),
+              ),
+            ],
       child: SingleChildScrollView(
         child: Column(
           mainAxisSize: MainAxisSize.min,

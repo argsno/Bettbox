@@ -7,7 +7,6 @@ import 'package:bett_box/views/proxies/common.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:flutter/services.dart';
 import 'package:intl/intl.dart';
-import 'package:restart_app/restart_app.dart';
 import 'package:tray_manager/tray_manager.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 
@@ -264,7 +263,7 @@ class Tray {
       final restartMenuItem = MenuItem(
         label: appLocalizations.restartApp,
         onClick: (_) async {
-          await Restart.restartApp();
+          await system.restartApp();
         },
       );
       menuItems.add(restartMenuItem);
@@ -324,7 +323,7 @@ class Tray {
       final menu = Menu(items: menuItems);
       await trayManager.setContextMenu(
         menu,
-        keepMenuOpen: silent,
+        keepMenuOpen: silent || system.isWindows,
         brightness: trayState.brightness,
       );
       if (Platform.isLinux) {
@@ -548,9 +547,12 @@ class Tray {
         testableProxies,
         testUrl: group.testUrl,
         groupName: group.name,
-        onDelayUpdated: system.isMacOS
-            ? () => appController.updateTray(false, true)
-            : null,
+        onDelayUpdated: system.isLinux
+            ? null
+            : () async {
+                if (!trayManager.isMenuOpen) return;
+                await appController.updateTray(false, true);
+              },
       );
     } catch (e) {
       commonPrint.warn('Delay test error: $e');
