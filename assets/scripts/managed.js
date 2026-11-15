@@ -4,12 +4,15 @@
  * 自定义分流远程规则集：@appshubcc https://github.com/appshubcc/bett-rules 
  */
 
-// @version 2026111105
+// @version 2026111501
 const Compatible_With_Bettbox = { ruleOptionsEnable: true };
 
 const ruleOptionsEnable = {
   '手动选择': true,
   '自动选择': false,
+  // 在「自动选择」之外额外生成 smart 类型的「智能选择」组：
+  // 按真实连接质量（首响应延迟、重传惩罚、失败冷却、按站点记忆）动态选路
+  '智能选择': false,
 
   'AI': true,
   'FCM': true,
@@ -31,6 +34,10 @@ const ruleOptionsEnable = {
 
   '极简国内外分流模式': false,
   '生成地区自动选择组': false,
+  '生成地区智能选择组': false,
+  // 仅订阅合并时生效：App 会把当前成员的前缀注入 bettboxSubscriptionPrefix，
+  // 每个订阅生成「订阅 X」手动组，并按「自动选择」「智能选择」两个总开关附带自动/智能组。
+  '每订阅一个分组': false,
   '隐藏地区手动选择组': false,
   '分流组添加所有节点': false,
   '生成高低倍率组': false,
@@ -297,6 +304,19 @@ const urlTestBaseOption = {
   hidden: true,
 };
 
+// smart 组固定每 5 分钟重测，interval / lazy / tolerance 对它无效，因此单独定义
+const smartBaseOption = {
+  ...groupBaseOption,
+  type: 'smart',
+  'exclude-type': 'DIRECT',
+  icon: `${iconBaseUrl}common/Auto.svg`,
+  hidden: true,
+};
+
+// App 在合并订阅时注入当前成员的前缀；单订阅执行时不存在这个变量。
+const subscriptionPrefix =
+  typeof bettboxSubscriptionPrefix === 'string' ? bettboxSubscriptionPrefix.trim() : '';
+
 const baseGroups = [
   {
     name: '手动选择',
@@ -307,6 +327,12 @@ const baseGroups = [
   {
     name: '自动选择',
     baseOption: urlTestBaseOption,
+    includeAll: true,
+    icon: `${iconBaseUrl}common/Auto.svg`,
+  },
+  {
+    name: '智能选择',
+    baseOption: smartBaseOption,
     includeAll: true,
     icon: `${iconBaseUrl}common/Auto.svg`,
   },
@@ -802,38 +828,98 @@ function filterAndNormalizeProxies(config) {
 }
 
 /**
- * 构建地区策略组，可附带自动选择组
+ * 构建地区策略组，可附带自动选择组与智能选择组
  */
 function createRegionGroup(name, icon, proxies) {
   const generateRegionAutoSelectEnabled = ruleOptionsEnable.生成地区自动选择组 || ruleOptionsEnable.隐藏地区手动选择组;
+  const generateRegionSmartSelectEnabled = ruleOptionsEnable.生成地区智能选择组;
   const hideManualSelectGroupEnabled = ruleOptionsEnable.隐藏地区手动选择组;
 
-  if (generateRegionAutoSelectEnabled) {
-    const urlTestName = `${name}-自动选择`;
+  if (!generateRegionAutoSelectEnabled && !generateRegionSmartSelectEnabled) {
     return [
-      {
-        ...urlTestBaseOption,
-        name: urlTestName,
-        proxies,
-      },
       {
         ...selectBaseOption,
         name,
         icon,
-        proxies: [urlTestName, ...proxies],
+        proxies,
         hidden: hideManualSelectGroupEnabled,
       },
     ];
   }
+
+  const autoSelectName = `${name}-自动选择`;
+  const smartSelectName = `${name}-智能选择`;
+  const regionGroups = [];
+  const groupProxies = [];
+
+  if (generateRegionAutoSelectEnabled) {
+    regionGroups.push({
+      ...urlTestBaseOption,
+      name: autoSelectName,
+      proxies,
+    });
+    groupProxies.push(autoSelectName);
+  }
+  if (generateRegionSmartSelectEnabled) {
+    regionGroups.push({
+      ...smartBaseOption,
+      name: smartSelectName,
+      proxies,
+    });
+    groupProxies.push(smartSelectName);
+  }
+
   return [
+    ...regionGroups,
     {
       ...selectBaseOption,
       name,
       icon,
-      proxies,
+      proxies: [...groupProxies, ...proxies],
       hidden: hideManualSelectGroupEnabled,
     },
   ];
+}
+
+/**
+ * 构建单个订阅的策略组：一个手动组，外加可选的自动/智能子组。
+ * 组名由合并时注入的订阅前缀决定，避免不同订阅的组在合并阶段互相覆盖。
+ */
+function createSubscriptionGroups(proxies) {
+  if (!ruleOptionsEnable.每订阅一个分组 || !subscriptionPrefix || proxies.length === 0) {
+    return [];
+  }
+
+  const name = `订阅 ${subscriptionPrefix}`;
+  const autoSelectName = `${name}-自动选择`;
+  const smartSelectName = `${name}-智能选择`;
+  const groups = [];
+  const groupProxies = [];
+
+  if (ruleOptionsEnable.自动选择) {
+    groups.push({
+      ...urlTestBaseOption,
+      name: autoSelectName,
+      proxies,
+    });
+    groupProxies.push(autoSelectName);
+  }
+  if (ruleOptionsEnable.智能选择) {
+    groups.push({
+      ...smartBaseOption,
+      name: smartSelectName,
+      proxies,
+    });
+    groupProxies.push(smartSelectName);
+  }
+
+  groups.push({
+    ...selectBaseOption,
+    name,
+    icon: `${iconBaseUrl}common/Proxy.svg`,
+    proxies: [...groupProxies, ...proxies],
+  });
+  return groups;
 }
 
 /**
@@ -940,7 +1026,7 @@ function sortByGroupOrder(services) {
   let last = -1;
   return services
     .map((svc, index) => {
-      const order = rank.get(svc.name) ?? rank.get(svc.name.replace(/-自动选择$/, ''));
+      const order = rank.get(svc.name) ?? rank.get(svc.name.replace(/-(?:自动选择|智能选择)$/, ''));
       if (order !== undefined) last = order;
       return { svc, index, key: order !== undefined ? order : last + 0.5 };
     })
@@ -964,11 +1050,19 @@ function buildFunctionalGroups(filteredProxies, generatedRegionGroups) {
   const finalRuleProviders = { ...baseRuleProviders };
 
   const allProxiesNames = filteredProxies.map((p) => p.name);
-  const groupNamesOfSelect = generatedRegionGroups.filter((g) => g.type === 'select').map((g) => g.name);
+  const subscriptionGroups = createSubscriptionGroups(allProxiesNames);
+  const subscriptionGroupNames = subscriptionGroups
+    .filter((g) => g.type === 'select')
+    .map((g) => g.name);
+  const selectGroupNames = [
+    ...generatedRegionGroups.filter((g) => g.type === 'select').map((g) => g.name),
+    ...subscriptionGroupNames,
+  ];
   const baseGroupNames = baseGroups.filter((g) => ruleOptionsEnable[g.name]).map((g) => g.name);
 
   if (minimalModeEnabled) {
     const autoSelectGroupEnabled = ruleOptionsEnable.自动选择;
+    const smartSelectGroupEnabled = ruleOptionsEnable.智能选择;
 
     const adBlockService = ruleOptionsEnable.AdBlock ? serviceConfigs.find((svc) => svc.priority) : null;
     const adBlockGroup = adBlockService && {
@@ -985,7 +1079,12 @@ function buildFunctionalGroups(filteredProxies, generatedRegionGroups) {
     const defaultGroup = {
       ...selectBaseOption,
       name: '默认代理',
-      proxies: [...allProxiesNames, ...(autoSelectGroupEnabled ? ['自动选择'] : [])],
+      proxies: [
+        ...subscriptionGroupNames,
+        ...allProxiesNames,
+        ...(autoSelectGroupEnabled ? ['自动选择'] : []),
+        ...(smartSelectGroupEnabled ? ['智能选择'] : []),
+      ],
       icon: `${iconBaseUrl}common/Proxy.svg`,
     };
 
@@ -994,6 +1093,12 @@ function buildFunctionalGroups(filteredProxies, generatedRegionGroups) {
       name: '自动选择',
       proxies: allProxiesNames,
       hidden: true,
+    };
+
+    const smartSelectGroup = {
+      ...smartBaseOption,
+      name: '智能选择',
+      proxies: allProxiesNames,
     };
 
     const directGroup = {
@@ -1010,6 +1115,8 @@ function buildFunctionalGroups(filteredProxies, generatedRegionGroups) {
       orderedGroups: [
         defaultGroup,
         ...(autoSelectGroupEnabled ? [autoSelectGroup] : []),
+        ...(smartSelectGroupEnabled ? [smartSelectGroup] : []),
+        ...subscriptionGroups,
         ...(adBlockGroup ? [adBlockGroup] : []),
         directGroup,
       ],
@@ -1024,7 +1131,7 @@ function buildFunctionalGroups(filteredProxies, generatedRegionGroups) {
   functionalGroups.push({
     ...selectBaseOption,
     name: '默认代理',
-    proxies: [...groupNamesOfSelect, ...baseGroupNames],
+    proxies: [...selectGroupNames, ...baseGroupNames],
     icon: `${iconBaseUrl}common/Proxy.svg`,
   });
 
@@ -1039,6 +1146,7 @@ function buildFunctionalGroups(filteredProxies, generatedRegionGroups) {
     '直连',
     ...serviceConfigs.map((svc) => svc.name),
     ...generatedRegionGroups.map((g) => g.name),
+    ...subscriptionGroups.map((g) => g.name),
     ...allProxiesNames,
     ...directProxies.map((p) => p.name),
   ]);
@@ -1060,11 +1168,11 @@ function buildFunctionalGroups(filteredProxies, generatedRegionGroups) {
       groupProxies = [...rejectGroupProxies];
     } else {
       groupProxies = !addAllNodesToServiceGroupsEnabled
-        ? ['默认代理', ...baseGroupNames, ...groupNamesOfSelect, ...(svc.direct ? ['直连'] : [])]
+        ? ['默认代理', ...baseGroupNames, ...selectGroupNames, ...(svc.direct ? ['直连'] : [])]
         : [
           '默认代理',
           ...baseGroupNames,
-          ...groupNamesOfSelect,
+          ...selectGroupNames,
           ...allProxiesNames,
           ...(svc.direct ? ['直连'] : []),
         ];
@@ -1101,6 +1209,7 @@ function buildFunctionalGroups(filteredProxies, generatedRegionGroups) {
     defaultGroup,
     ...sortByGroupOrder([
       ...serviceGroups,
+      ...subscriptionGroups,
       directGroup,
       ...generatedRegionGroups,
     ]),

@@ -20,6 +20,21 @@ void main() {
     expect(bundlePrefixOf(''), '');
   });
 
+  test('bundle prefix is injected for subscription groups', () {
+    final script = Script(
+      id: 'managed',
+      label: 'managed',
+      content: 'main({});',
+    );
+    final prefixed = ManagedScript.withBundlePrefix(script, ' A ');
+    expect(
+      prefixed.content,
+      'const bettboxSubscriptionPrefix = "A";\nmain({});',
+    );
+    expect(prefixed.digest, isNotNull);
+    expect(ManagedScript.withBundlePrefix(script, '  '), same(script));
+  });
+
   test('route icons match exactly, then by trimmed names', () {
     final index = routeIconIndex([
       'YouTube.svg',

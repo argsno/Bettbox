@@ -826,6 +826,7 @@ class AppController {
     final script = await ManagedScript.script(
       _ref.read(managedSettingProvider),
     );
+    final perSubscriptionGroups = script.customOptions?['每订阅一个分组'] ?? false;
     final inputs = <({String prefix, String path})>[];
     final failures = <String, String>{};
     final files = <File>[];
@@ -834,17 +835,21 @@ class AppController {
         final target = profiles.getProfile(member.id);
         if (target == null) continue;
         try {
+          final prefix =
+              member.prefix ?? bundlePrefixOf(target.label ?? target.id);
+          // The managed script runs per member; inject the bundle prefix so it
+          // can emit a group for this subscription before the merge.
+          final memberScript = perSubscriptionGroups
+              ? ManagedScript.withBundlePrefix(script, prefix)
+              : script;
           final path = await globalState.writeScriptedConfig(
             target,
-            script,
+            memberScript,
             managed: true,
             refresh: refresh,
           );
           files.add(File(path));
-          inputs.add((
-            prefix: member.prefix ?? bundlePrefixOf(target.label ?? target.id),
-            path: path,
-          ));
+          inputs.add((prefix: prefix, path: path));
         } catch (e) {
           failures[member.id] = e.formatError.split('\n').first;
         }

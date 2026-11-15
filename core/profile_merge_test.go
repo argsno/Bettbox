@@ -170,6 +170,63 @@ func TestMergeRestoresGroupOrder(t *testing.T) {
 	}
 }
 
+func TestMergeKeepsSmartGroupOptions(t *testing.T) {
+	smart := mergeGroup("智能选择", "HK 01")
+	smart["type"] = "smart"
+	smart["policy-priority"] = "Premium:0.9;Backup:1.3"
+	merged, _ := mergeProfileConfigs([]mergeInput{
+		{config: mergeConfig([]map[string]any{mergeProxy("HK 01", "hk.com")}, smart), prefix: "A"},
+		{config: mergeConfig([]map[string]any{mergeProxy("JP 01", "jp.com")}, map[string]any{
+			"name": "智能选择", "type": "url-test", "proxies": []any{"JP 01"},
+		}), prefix: "B"},
+	})
+	groups := mapItems(merged["proxy-groups"])
+	if len(groups) != 1 {
+		t.Fatalf("groups = %v", groups)
+	}
+	if got := stringValue(groups[0]["type"]); got != "smart" {
+		t.Fatalf("type = %v, want smart", got)
+	}
+	if got := stringValue(groups[0]["policy-priority"]); got != "Premium:0.9;Backup:1.3" {
+		t.Fatalf("policy-priority = %v", got)
+	}
+	if got := mergedGroups(merged)["智能选择"]; !reflect.DeepEqual(got, []string{"[ A ] - HK 01", "[ B ] - JP 01"}) {
+		t.Fatalf("group refs = %v", got)
+	}
+}
+
+func TestMergeKeepsSubscriptionGroupsSeparate(t *testing.T) {
+	merged, _ := mergeProfileConfigs([]mergeInput{
+		{
+			config: mergeConfig(
+				[]map[string]any{mergeProxy("HK 01", "hk.a.com")},
+				mergeGroup("订阅 A-自动选择", "HK 01"),
+				mergeGroup("订阅 A", "订阅 A-自动选择", "HK 01"),
+				mergeGroup("默认代理", "订阅 A"),
+			),
+			prefix: "A",
+		},
+		{
+			config: mergeConfig(
+				[]map[string]any{mergeProxy("JP 01", "jp.b.com")},
+				mergeGroup("订阅 B", "JP 01"),
+				mergeGroup("默认代理", "订阅 B"),
+			),
+			prefix: "B",
+		},
+	})
+	groups := mergedGroups(merged)
+	if got, want := groups["订阅 A"], []string{"订阅 A-自动选择", "[ A ] - HK 01"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("订阅 A = %v, want %v", got, want)
+	}
+	if got, want := groups["订阅 B"], []string{"[ B ] - JP 01"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("订阅 B = %v, want %v", got, want)
+	}
+	if got, want := groups["默认代理"], []string{"订阅 A", "订阅 B"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("默认代理 = %v, want %v", got, want)
+	}
+}
+
 func TestMergeKeepsFirstGlobalsAndUnionsProviders(t *testing.T) {
 	first := mergeConfig([]map[string]any{mergeProxy("HK", "a.com")})
 	first["mode"] = "rule"
@@ -248,6 +305,43 @@ func TestMergeHostsKeepFirst(t *testing.T) {
 	merged, _ := mergeProfileConfigs([]mergeInput{{config: first}, {config: second}})
 	if got := mapValue(merged["hosts"]); !reflect.DeepEqual(got, map[string]any{"a.com": "1.1.1.1", "b.com": "3.3.3.3"}) {
 		t.Fatalf("hosts = %v", got)
+	}
+}
+
+func TestHandleMergeProfilesAcceptsSmartGroup(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name string, value map[string]any) string {
+		data, err := json.Marshal(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	smart := func(ref string) map[string]any {
+		group := mergeGroup("智能选择", ref)
+		group["type"] = "smart"
+		group["policy-priority"] = "Premium:0.9;Backup:1.3"
+		return group
+	}
+	first := write("a.json", mergeConfig([]map[string]any{mergeProxy("HK", "hk.a.com")}, mergeGroup("默认代理", "HK"), smart("HK")))
+	second := write("b.json", mergeConfig([]map[string]any{mergeProxy("JP", "jp.b.com")}, mergeGroup("默认代理", "JP"), smart("JP")))
+	output := filepath.Join(dir, "bundle.yaml")
+	if _, err := handleMergeProfiles(&MergeProfilesParams{
+		Output:  output,
+		Members: []MergeMember{{Prefix: "A", Path: first}, {Prefix: "B", Path: second}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := config.Parse(data); err != nil {
+		t.Fatal(err)
 	}
 }
 

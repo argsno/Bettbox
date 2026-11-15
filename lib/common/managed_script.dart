@@ -486,6 +486,20 @@ class ManagedScript {
     );
   }
 
+  /// Prepends the bundle member prefix consumed by the managed script to
+  /// generate per-subscription groups before member configs are merged.
+  static Script withBundlePrefix(Script script, String prefix) {
+    final value = prefix.trim();
+    if (value.isEmpty) return script;
+    final content =
+        'const bettboxSubscriptionPrefix = ${jsonEncode(value)};\n${script.content}';
+    return script.copyWith(
+      content: content,
+      digest: content.toMd5(),
+      volatile: script.volatile ?? volatileScriptPattern.hasMatch(content),
+    );
+  }
+
   static Future<String?> save(String content) async {
     final normalized = content.replaceAll(RegExp(r'\r\n?'), '\n');
     final bundled = (await readBundled()).replaceAll(RegExp(r'\r\n?'), '\n');

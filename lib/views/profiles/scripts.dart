@@ -32,8 +32,11 @@ const Duration _kMinLoadingDuration = Duration(seconds: 1);
 const _optionIcons = {
   '极简国内外分流模式': Icons.looks_one_outlined,
   '生成地区自动选择组': Icons.auto_mode,
+  '生成地区智能选择组': Icons.bolt,
+  '每订阅一个分组': Icons.subscriptions,
   '隐藏地区手动选择组': Icons.visibility_off,
   '分流组添加所有节点': Icons.playlist_add,
+  '智能选择': Icons.bolt,
   '生成高低倍率组': Icons.leaderboard_outlined,
   '过滤低倍率节点': Icons.trending_down,
   '过滤高倍率节点': Icons.trending_up,
