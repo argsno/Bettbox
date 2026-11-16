@@ -1809,7 +1809,7 @@ proxy-groups:
   #                   # 取舍见 PR #3133。
 
   # smart 根据真实连接质量动态选择节点（首响应延迟、重传惩罚、按站点记忆），失败时按优选集合、健康节点、失败节点的顺序回退
-  # 重传惩罚依赖系统 TCP 计数器：macOS 与 Linux（含 Android）提供，Windows 暂缺，缺失时自动退化为仅延迟评分
+  # 重传惩罚依赖系统 TCP 计数器：macOS 与 Linux（含 Android）提供；Windows 以及多路复用传输可能拿不到可归属的重传计数，缺失时自动退化为仅延迟评分
   - name: "smart-auto"
     type: smart
     proxies:
@@ -1818,7 +1818,13 @@ proxy-groups:
       - vmess1
     url: "https://cp.cloudflare.com/generate_204"
     # policy-priority: "Premium:0.9;Backup:1.3" # 正则:系数，系数<1 提升优先级，>1 降低优先级，第一个匹配的规则生效
-    # 注意：smart 组固定每 5 分钟重新测试一轮，interval 参数无效
+    # 注意：
+    # - 使用 proxies 的 smart 组检测间隔固定为 300 秒，interval 参数无效；使用 use 的 smart 组沿用 provider 的健康检查设置。
+    # - lazy 默认 true（与 url-test 一致），空闲超过 interval 时会跳过检测；不会无条件每 300 秒探测一次。
+    # - tolerance 被忽略。
+    # - 延迟样本按 10 分钟半衰期向测速延迟回落；失败冷却按 1/2/4/8 分钟增长，站点失败记忆 10 分钟，成功记忆 1 小时。
+    # - UDP 转发只在支持 UDP 的成员中选择，失败时继续尝试下一个成员。
+    # - 面板中的 Now 显示最近使用最多的策略，而不是下一次连接实际使用的策略。
 
   # select 用户自行选择节点
   - name: Proxy

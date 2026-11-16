@@ -31,15 +31,19 @@ const (
 	smartUnknownScore       = 500.0   // ms, assumed latency before any sample exists
 	smartMinScore           = 1.0     // ms
 	smartMaxScore           = 30000.0 // ms
-	smartPreferredGapRatio  = 0.15    // preferred set: scores within max(15%, 20ms) of the best
-	smartPreferredGapMin    = 20.0    // ms
+	smartPreferredGapRatio  = 0.15    // preferred set: scores within max(15%, 5ms) of the best
+	smartPreferredGapMin    = 5.0     // ms
 	smartSitePreferredGap   = 0.4     // widened gap for policies that recently worked for the site
 	smartFailCooldown       = time.Minute
+	smartFailCooldownMax    = 8 * time.Minute
 	smartFailPenalty        = 600.0 // ms added while a policy is in failure cooldown
 	smartLossPenaltyPerPct  = 50.0  // ~50ms per 1% retransmission, like Surge
 	smartLossPenaltyMax     = 2000.0
+	smartScoreHalfLife      = 10 * time.Minute
+	smartLossHalfLife       = 10 * time.Minute
 	smartUsageHalfLife      = 10 * time.Minute
 	smartSiteMemoryTTL      = time.Hour
+	smartSiteFailureTTL     = 10 * time.Minute
 	smartSiteMemoryMaxSites = 512
 	smartDialRetryLimit     = 3
 )
@@ -56,7 +60,9 @@ type smartPriorityRule struct {
 // smartPolicyState tracks the observed quality of one member policy.
 type smartPolicyState struct {
 	score        float64 // EWMA of first-response latency in ms; 0 means unknown
+	lastSample   time.Time
 	lossPenalty  float64 // EWMA of the retransmission penalty in ms
+	lossUpdated  time.Time
 	lastFail     time.Time
 	failStreak   int
 	usage        float64 // decayed session count, used for Now()
@@ -75,40 +81,105 @@ func (st *smartPolicyState) observeLatency(delayMs float64, now time.Time) {
 	} else {
 		st.score = st.score*(1-smartEwmaAlpha) + delayMs*smartEwmaAlpha
 	}
+	st.lastSample = now
 	st.failStreak = 0
 }
 
 // observeFailure sharply worsens the policy: while the cooldown lasts it is
 // ranked below healthy members, and it recovers through later tests or traffic.
+// A failure that arrives after the previous cooldown already elapsed starts a
+// new streak instead of extending a stale one forever.
 func (st *smartPolicyState) observeFailure(now time.Time) {
+	if !st.lastFail.IsZero() && now.Sub(st.lastFail) > st.failCooldown() {
+		st.failStreak = 0
+	}
 	st.failStreak++
 	st.lastFail = now
 }
 
+// failCooldown grows with consecutive failures, capped at smartFailCooldownMax.
+func (st *smartPolicyState) failCooldown() time.Duration {
+	if st.failStreak <= 0 {
+		return smartFailCooldown
+	}
+	cooldown := smartFailCooldown
+	for i := 1; i < st.failStreak; i++ {
+		cooldown *= 2
+		if cooldown >= smartFailCooldownMax {
+			return smartFailCooldownMax
+		}
+	}
+	return cooldown
+}
+
 // observeLoss folds an observed retransmission ratio (0.01 = 1%) into the
 // policy's loss penalty.
-func (st *smartPolicyState) observeLoss(ratio float64) {
+func (st *smartPolicyState) observeLoss(ratio float64, now time.Time) {
 	penalty := math.Min(ratio*100*smartLossPenaltyPerPct, smartLossPenaltyMax)
 	if st.lossPenalty <= 0 {
 		st.lossPenalty = penalty
 	} else {
 		st.lossPenalty = st.lossPenalty*0.5 + penalty*0.5
 	}
+	st.lossUpdated = now
 }
 
-func (st *smartPolicyState) effectiveScore(fallback float64, now time.Time) float64 {
-	score := st.score
-	if score <= 0 {
-		score = fallback
+// decayedLoss relaxes a stale loss penalty; without a timestamp the stored
+// penalty is used unchanged.
+func (st *smartPolicyState) decayedLoss(now time.Time) float64 {
+	if st.lossUpdated.IsZero() {
+		return st.lossPenalty
 	}
-	score += st.lossPenalty
-	if st.failStreak > 0 && now.Sub(st.lastFail) < smartFailCooldown {
-		score += smartFailPenalty * float64(st.failStreak)
+	age := now.Sub(st.lossUpdated)
+	if age <= 0 {
+		return st.lossPenalty
+	}
+	return st.lossPenalty * math.Exp2(-age.Seconds()/smartLossHalfLife.Seconds())
+}
+
+// effectiveLatency is the policy's latency in ms: the EWMA sample relaxed
+// toward the URL-test fallback by its age, clamped to the configured range.
+func (st *smartPolicyState) effectiveLatency(fallback float64, now time.Time) float64 {
+	score := fallback
+	if st.score > 0 && !st.lastSample.IsZero() {
+		age := now.Sub(st.lastSample)
+		if age < 0 {
+			age = 0
+		}
+		// A stale sample relaxes toward the current URL-test fallback instead of
+		// pinning the policy to an old measurement.
+		score = fallback + (st.score-fallback)*math.Exp2(-age.Seconds()/smartScoreHalfLife.Seconds())
 	}
 	if score < smartMinScore {
 		score = smartMinScore
 	}
+	if score > smartMaxScore {
+		score = smartMaxScore
+	}
 	return score
+}
+
+// penalty is the loss plus failure penalty in ms. It is added after the
+// policy-priority factor has been applied, so a factor below 1 cannot soften
+// an observed penalty.
+func (st *smartPolicyState) penalty(now time.Time) float64 {
+	penalty := st.decayedLoss(now)
+	if st.failStreak > 0 && now.Sub(st.lastFail) < st.failCooldown() {
+		penalty += smartFailPenalty * float64(st.failStreak)
+	}
+	return penalty
+}
+
+// effectiveScore is the latency plus the loss and failure penalties, before
+// the policy-priority factor; factor 1 keeps the historical weighting.
+func (st *smartPolicyState) effectiveScore(fallback float64, now time.Time) float64 {
+	return st.scored(fallback, 1.0, now)
+}
+
+// scored applies the policy-priority factor to the latency only: penalties
+// describe observed damage and keep their full weight whatever the factor is.
+func (st *smartPolicyState) scored(fallback, factor float64, now time.Time) float64 {
+	return st.effectiveLatency(fallback, now)*factor + st.penalty(now)
 }
 
 func (st *smartPolicyState) bumpUsage(now time.Time) {
@@ -191,14 +262,38 @@ func (s *Smart) Now() string {
 	return bestScoreName
 }
 
+// smartNodeFailure reports whether a first-write error is evidence against the
+// node. Caller-side cancellation and unsupported capabilities say nothing about
+// the node's health; a deadline here has no caller context to inspect, so it is
+// treated as a node failure.
+func smartNodeFailure(err error) bool {
+	return err != nil &&
+		!errors.Is(err, context.Canceled) &&
+		!errors.Is(err, C.ErrNotSupport)
+}
+
+// smartDialFailure reports whether a dial error is evidence against the node.
+// A deadline from a live caller context is the normal signal for a hanging
+// node, while an error after the caller's context is done says nothing about
+// the node. ErrNotSupport is a capability mismatch, not a health signal.
+func smartDialFailure(ctx context.Context, err error) bool {
+	if err == nil || errors.Is(err, C.ErrNotSupport) {
+		return false
+	}
+	if ctx != nil && ctx.Err() != nil {
+		return false
+	}
+	return true
+}
+
 // DialContext implements C.ProxyAdapter
 func (s *Smart) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, error) {
 	candidates := s.orderedCandidates(metadata, true)
 
 	var lastErr error
+	var lastProxy C.Proxy
 	attempts := 0
 	for _, proxy := range candidates {
-		proxy := proxy
 		if err := ctx.Err(); err != nil {
 			if lastErr == nil {
 				lastErr = err
@@ -206,18 +301,30 @@ func (s *Smart) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, 
 			break
 		}
 
-		start := time.Now()
+		dialStart := time.Now()
 		conn, err := proxy.DialContext(ctx, metadata)
 		if err != nil {
 			lastErr = err
+			lastProxy = proxy
 			attempts++
-			s.onDialFailed(proxy.Type(), err, s.healthCheck)
-			s.reportFailure(proxy.Name(), metadata)
+			if smartDialFailure(ctx, err) {
+				s.reportFailure(proxy.Name(), metadata)
+			}
+			// Only the caller's context ending stops the retry loop. A node's
+			// own dial timeout is a failure worth trying the next member for.
+			if ctx.Err() != nil {
+				break
+			}
 			if attempts >= smartDialRetryLimit {
 				break
 			}
 			log.Debugln("[Smart] %s dial via %s failed: %v, fallback to next candidate", s.Name(), proxy.Name(), err)
 			continue
+		}
+		dialDone := time.Now()
+		dialLatency := dialDone.Sub(dialStart)
+		if dialLatency < 0 {
+			dialLatency = 0
 		}
 
 		s.reportUsed(proxy.Name())
@@ -227,33 +334,75 @@ func (s *Smart) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, 
 			conn = callback.NewFirstWriteCallBackConn(conn, func(err error) {
 				if err == nil {
 					s.onDialSuccess()
-				} else {
+					return
+				}
+				if smartNodeFailure(err) {
 					s.onDialFailed(proxy.Type(), err, s.healthCheck)
 				}
 			})
 		}
 
-		return newSmartConn(conn, s, proxy.Name(), metadata, start), nil
+		return newSmartConn(conn, s, proxy.Name(), metadata, dialDone, dialLatency), nil
 	}
 
 	if lastErr == nil {
 		lastErr = errors.New("smart: no available proxy")
+	} else if lastProxy != nil && smartDialFailure(ctx, lastErr) {
+		// Retrying one request through several members is one group-level
+		// failure, not one per candidate.
+		s.onDialFailed(lastProxy.Type(), lastErr, s.healthCheck)
 	}
 	return nil, lastErr
 }
 
 // ListenPacketContext implements C.ProxyAdapter
 func (s *Smart) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (C.PacketConn, error) {
-	proxy := s.Unwrap(metadata, true)
-	pc, err := proxy.ListenPacketContext(ctx, metadata)
-	if err != nil {
-		s.onDialFailed(proxy.Type(), err, s.healthCheck)
-		s.reportFailure(proxy.Name(), metadata)
-		return nil, err
+	candidates := s.orderedCandidates(metadata, true)
+
+	var lastErr error
+	var lastProxy C.Proxy
+	attempts := 0
+	for _, proxy := range candidates {
+		if !proxy.SupportUDP() {
+			continue
+		}
+		if err := ctx.Err(); err != nil {
+			if lastErr == nil {
+				lastErr = err
+			}
+			break
+		}
+
+		pc, err := proxy.ListenPacketContext(ctx, metadata)
+		if err != nil {
+			lastErr = err
+			lastProxy = proxy
+			attempts++
+			if smartDialFailure(ctx, err) {
+				s.reportFailure(proxy.Name(), metadata)
+			}
+			if ctx.Err() != nil {
+				break
+			}
+			if attempts >= smartDialRetryLimit {
+				break
+			}
+			log.Debugln("[Smart] %s udp via %s failed: %v, fallback to next candidate", s.Name(), proxy.Name(), err)
+			continue
+		}
+
+		s.reportUsed(proxy.Name())
+		pc.AppendToChains(s)
+		return pc, nil
 	}
-	s.reportUsed(proxy.Name())
-	pc.AppendToChains(s)
-	return pc, nil
+
+	if lastErr == nil {
+		return nil, C.ErrNotSupport
+	}
+	if lastProxy != nil && smartDialFailure(ctx, lastErr) {
+		s.onDialFailed(lastProxy.Type(), lastErr, s.healthCheck)
+	}
+	return nil, lastErr
 }
 
 // SupportUDP implements C.ProxyAdapter
@@ -261,21 +410,70 @@ func (s *Smart) SupportUDP() bool {
 	if s.disableUDP {
 		return false
 	}
-	return s.Unwrap(nil, false).SupportUDP()
+	for _, proxy := range s.GetProxies(false) {
+		if proxy != nil && proxy.SupportUDP() {
+			return true
+		}
+	}
+	return false
 }
 
 // IsL3Protocol implements C.ProxyAdapter
 func (s *Smart) IsL3Protocol(metadata *C.Metadata) bool {
-	return s.Unwrap(metadata, false).IsL3Protocol(metadata)
+	proxy := s.representativeProxy(metadata, false)
+	if proxy == nil {
+		return false
+	}
+	return proxy.IsL3Protocol(metadata)
 }
 
 // Unwrap implements C.ProxyAdapter
 func (s *Smart) Unwrap(metadata *C.Metadata, touch bool) C.Proxy {
-	candidates := s.orderedCandidates(metadata, touch)
-	if len(candidates) == 0 {
-		return s.EmptyFallback()
+	if proxy := s.representativeProxy(metadata, touch); proxy != nil {
+		return proxy
 	}
-	return candidates[0]
+	return s.EmptyFallback()
+}
+
+// representativeProxy returns the deterministic policy that stands for the
+// group: the pinned policy when it is still a member, otherwise the
+// best-scored alive policy, otherwise the best-scored policy. Capability
+// queries and Unwrap use it so the answer never depends on a random pick.
+func (s *Smart) representativeProxy(metadata *C.Metadata, touch bool) C.Proxy {
+	proxies := s.GetProxies(touch)
+
+	now := time.Now()
+	s.mu.Lock()
+	pinned := s.selected
+	var pinnedProxy, bestAlive, bestAny C.Proxy
+	bestAliveScore, bestAnyScore := math.MaxFloat64, math.MaxFloat64
+	for _, proxy := range proxies {
+		if proxy == nil {
+			continue
+		}
+		name := proxy.Name()
+		if pinned != "" && name == pinned {
+			pinnedProxy = proxy
+		}
+		score := s.scoreOf(proxy, s.states[name], now)
+		if score < bestAnyScore {
+			bestAnyScore = score
+			bestAny = proxy
+		}
+		if proxy.AliveForTestUrl(s.testUrl) && score < bestAliveScore {
+			bestAliveScore = score
+			bestAlive = proxy
+		}
+	}
+	s.mu.Unlock()
+
+	if pinnedProxy != nil {
+		return pinnedProxy
+	}
+	if bestAlive != nil {
+		return bestAlive
+	}
+	return bestAny
 }
 
 // MarshalJSON implements C.ProxyAdapter
@@ -333,9 +531,20 @@ func (s *Smart) URLTest(ctx context.Context, url string, expectedStatus utils.In
 
 func (s *Smart) healthCheck() {
 	s.GroupBase.healthCheck()
+	// AliveForTestUrl consults each proxy's own state; snapshot it before taking
+	// s.mu so this lock is never held while calling into a proxy.
+	alive := make(map[string]bool)
+	for _, proxy := range s.GetProxies(false) {
+		if proxy == nil {
+			continue
+		}
+		alive[proxy.Name()] = proxy.AliveForTestUrl(s.testUrl)
+	}
 	s.mu.Lock()
-	for _, st := range s.states {
-		st.failStreak = 0
+	for name, st := range s.states {
+		if alive[name] {
+			st.failStreak = 0
+		}
 	}
 	s.mu.Unlock()
 }
@@ -378,7 +587,7 @@ func (s *Smart) orderedCandidates(metadata *C.Metadata, touch bool) []C.Proxy {
 		if siteRecord != nil {
 			if entry, ok := siteRecord.proxies[proxy.Name()]; ok {
 				successFresh := !entry.lastSuccess.IsZero() && now.Sub(entry.lastSuccess) < smartSiteMemoryTTL
-				failureFresh := !entry.lastFailure.IsZero() && now.Sub(entry.lastFailure) < smartSiteMemoryTTL
+				failureFresh := !entry.lastFailure.IsZero() && now.Sub(entry.lastFailure) < smartSiteFailureTTL
 				item.siteHit = successFresh && (!failureFresh || entry.lastSuccess.After(entry.lastFailure))
 				item.siteMiss = failureFresh && !item.siteHit
 			}
@@ -393,18 +602,18 @@ func (s *Smart) orderedCandidates(metadata *C.Metadata, touch bool) []C.Proxy {
 
 	order := make([]C.Proxy, 0, len(candidates))
 	skip := make(map[int]struct{}, 2)
+	firstPick := -1
 
 	if pinned != "" {
 		for i, item := range candidates {
 			if item.proxy.Name() == pinned {
-				order = append(order, item.proxy)
-				skip[i] = struct{}{}
+				firstPick = i
 				break
 			}
 		}
 	}
 
-	if len(order) == 0 {
+	if firstPick < 0 {
 		best := 0.0
 		hasBest := false
 		for _, item := range candidates {
@@ -434,14 +643,26 @@ func (s *Smart) orderedCandidates(metadata *C.Metadata, touch bool) []C.Proxy {
 		}
 
 		if len(preferred) > 0 {
-			pick := preferred[rand.Intn(len(preferred))]
-			order = append(order, candidates[pick].proxy)
-			skip[pick] = struct{}{}
+			firstPick = preferred[rand.Intn(len(preferred))]
 		} else {
-			// nothing healthy (or everything suspended for this site): fall back to the best score
-			order = append(order, candidates[0].proxy)
-			skip[0] = struct{}{}
+			// nothing preferred: still try a live policy before a dead one, even
+			// if every live policy is suspended for this site.
+			firstPick = 0
+			for i, item := range candidates {
+				if item.alive {
+					firstPick = i
+					break
+				}
+			}
 		}
+	}
+
+	if firstPick >= 0 {
+		first := candidates[firstPick]
+		order = append(order, first.proxy)
+		skip[firstPick] = struct{}{}
+		log.Debugln("[Smart] %s picked %s (score %.1fms, siteHit=%t, siteMiss=%t, site=%q)",
+			s.Name(), first.proxy.Name(), first.score, first.siteHit, first.siteMiss, siteKey)
 	}
 
 	for i, item := range candidates {
@@ -463,20 +684,19 @@ func (s *Smart) orderedCandidates(metadata *C.Metadata, touch bool) []C.Proxy {
 	return order
 }
 
-// scoreOf combines the policy's EWMA latency (seeded by URL test results),
-// loss penalty and failure penalty, multiplied by the policy-priority factor.
+// scoreOf combines the policy's EWMA latency (seeded by URL test results) with
+// its loss and failure penalties. The policy-priority factor scales the
+// latency only, so a premium factor cannot also discount a failure penalty.
 func (s *Smart) scoreOf(proxy C.Proxy, st *smartPolicyState, now time.Time) float64 {
 	fallback := smartUnknownScore
 	if delay := proxy.LastDelayForTestUrl(s.testUrl); delay != 0xffff && delay > 0 {
 		fallback = float64(delay)
 	}
-	var score float64
+	factor := s.priorityFactor(proxy.Name())
 	if st == nil {
-		score = fallback
-	} else {
-		score = st.effectiveScore(fallback, now)
+		return fallback * factor
 	}
-	return score * s.priorityFactor(proxy.Name())
+	return st.scored(fallback, factor, now)
 }
 
 func (s *Smart) priorityFactor(name string) float64 {
@@ -498,12 +718,16 @@ func (s *Smart) stateOf(name string) *smartPolicyState {
 }
 
 func (s *Smart) reportLatency(name string, metadata *C.Metadata, delayMs float64) {
-	if delayMs < smartMinScore || delayMs > smartMaxScore {
-		return
-	}
 	now := time.Now()
 	s.mu.Lock()
-	s.stateOf(name).observeLatency(delayMs, now)
+	if delayMs < smartMinScore {
+		delayMs = smartMinScore
+	}
+	// A response this late is more likely a slow endpoint or long-poll than a
+	// useful node-quality sample. Keep the site success, drop the score sample.
+	if delayMs <= smartMaxScore {
+		s.stateOf(name).observeLatency(delayMs, now)
+	}
 	s.rememberSite(metadata, name, true, now)
 	s.mu.Unlock()
 }
@@ -525,7 +749,7 @@ func (s *Smart) reportRetransmit(name string, delta sockstat.TCPStats, baseOK bo
 		return
 	}
 	s.mu.Lock()
-	s.stateOf(name).observeLoss(ratio)
+	s.stateOf(name).observeLoss(ratio, time.Now())
 	s.mu.Unlock()
 }
 
@@ -550,7 +774,7 @@ func (s *Smart) rememberSite(metadata *C.Metadata, name string, success bool, no
 			s.pruneSites(now)
 		}
 		if len(s.sites) >= smartSiteMemoryMaxSites {
-			return
+			s.evictOldestSite()
 		}
 		record = &smartSiteRecord{proxies: make(map[string]*smartSiteEntry)}
 		s.sites[key] = record
@@ -569,12 +793,40 @@ func (s *Smart) rememberSite(metadata *C.Metadata, name string, success bool, no
 	record.updated = now
 }
 
-// pruneSites drops expired records; the caller must hold s.mu.
+// pruneSites drops records untouched for the success TTL, expired per-proxy
+// entries, and records that became empty; the caller must hold s.mu.
 func (s *Smart) pruneSites(now time.Time) {
 	for key, record := range s.sites {
-		if now.Sub(record.updated) > smartSiteMemoryTTL {
+		if !record.updated.IsZero() && now.Sub(record.updated) > smartSiteMemoryTTL {
+			delete(s.sites, key)
+			continue
+		}
+		for name, entry := range record.proxies {
+			successFresh := !entry.lastSuccess.IsZero() && now.Sub(entry.lastSuccess) < smartSiteMemoryTTL
+			failureFresh := !entry.lastFailure.IsZero() && now.Sub(entry.lastFailure) < smartSiteFailureTTL
+			if !successFresh && !failureFresh {
+				delete(record.proxies, name)
+			}
+		}
+		if len(record.proxies) == 0 {
 			delete(s.sites, key)
 		}
+	}
+}
+
+// evictOldestSite drops the least-recently-updated record to make room for a
+// new site; the caller must hold s.mu.
+func (s *Smart) evictOldestSite() {
+	oldestKey := ""
+	var oldest time.Time
+	for key, record := range s.sites {
+		if oldestKey == "" || record.updated.Before(oldest) {
+			oldestKey = key
+			oldest = record.updated
+		}
+	}
+	if oldestKey != "" {
+		delete(s.sites, oldestKey)
 	}
 }
 
@@ -608,16 +860,21 @@ func parsePolicyPriority(value string) ([]smartPriorityRule, error) {
 }
 
 // smartConn wraps a member connection and feeds the group's scorer: it reports
-// the first-response latency on the first inbound byte, a failure when the
-// connection dies before any data arrives, and the socket's retransmission
-// counters when it closes.
+// the first-response latency on the first inbound byte, a failure when a request
+// was written but no data arrived, and the socket's retransmission counters
+// when it closes.
 type smartConn struct {
 	C.Conn
 
-	smart     *Smart
-	proxyName string
-	metadata  *C.Metadata
-	start     time.Time
+	smart       *Smart
+	proxyName   string
+	metadata    *C.Metadata
+	dialDone    time.Time     // dial completion, the earliest point latency can start
+	dialLatency time.Duration // time spent in proxy.DialContext
+
+	writeMutex sync.Mutex
+	firstWrite time.Time // completion of the first outbound write
+	wroteData  atomic.Bool
 
 	base   sockstat.TCPStats
 	baseOK bool
@@ -627,13 +884,14 @@ type smartConn struct {
 	closeOnce     sync.Once
 }
 
-func newSmartConn(conn C.Conn, smart *Smart, proxyName string, metadata *C.Metadata, start time.Time) C.Conn {
+func newSmartConn(conn C.Conn, smart *Smart, proxyName string, metadata *C.Metadata, dialDone time.Time, dialLatency time.Duration) C.Conn {
 	sc := &smartConn{
-		Conn:      conn,
-		smart:     smart,
-		proxyName: proxyName,
-		metadata:  metadata,
-		start:     start,
+		Conn:        conn,
+		smart:       smart,
+		proxyName:   proxyName,
+		metadata:    metadata,
+		dialDone:    dialDone,
+		dialLatency: dialLatency,
 	}
 	sc.base, sc.baseOK = sockstat.Sample(conn)
 	return sc
@@ -655,23 +913,69 @@ func (c *smartConn) ReadBuffer(buffer *buf.Buffer) error {
 	return err
 }
 
+func (c *smartConn) Write(b []byte) (int, error) {
+	n, err := c.Conn.Write(b)
+	if n > 0 {
+		c.markWrite()
+	}
+	return n, err
+}
+
+func (c *smartConn) WriteBuffer(buffer *buf.Buffer) error {
+	size := buffer.Len()
+	err := c.Conn.WriteBuffer(buffer)
+	if err == nil && size > 0 {
+		c.markWrite()
+	}
+	return err
+}
+
 func (c *smartConn) Close() error {
 	c.closeOnce.Do(func() {
 		// the socket must still be open to read its counters
 		if stats, ok := sockstat.Sample(c.Conn); ok {
 			c.smart.reportRetransmit(c.proxyName, stats.Sub(c.base), c.baseOK)
 		}
-		if !c.gotData.Load() {
+		// Only an unanswered request is evidence against the node: a connection
+		// closed before any write (browser preconnect, canceled request) says
+		// nothing about its health.
+		if c.wroteData.Load() && !c.gotData.Load() {
 			c.smart.reportFailure(c.proxyName, c.metadata)
 		}
 	})
 	return c.Conn.Close()
 }
 
+func (c *smartConn) markWrite() {
+	c.writeMutex.Lock()
+	defer c.writeMutex.Unlock()
+	if c.firstWrite.IsZero() {
+		c.firstWrite = time.Now()
+	}
+	c.wroteData.Store(true)
+}
+
+// firstResponseDelay keeps real samples on the same basis as URLTest: the
+// caller's think time after the dial is excluded, but the proxy dial leg is
+// added back so a real sample and a LastDelayForTestUrl seed are comparable.
+func firstResponseDelay(base, firstByte time.Time, dialLatency time.Duration) time.Duration {
+	delay := firstByte.Sub(base) + dialLatency
+	if delay < 0 {
+		return 0
+	}
+	return delay
+}
+
 func (c *smartConn) markFirstByte() {
 	c.firstByteOnce.Do(func() {
 		c.gotData.Store(true)
-		delayMs := float64(time.Since(c.start)) / float64(time.Millisecond)
+		c.writeMutex.Lock()
+		base := c.dialDone
+		if c.firstWrite.After(base) {
+			base = c.firstWrite
+		}
+		c.writeMutex.Unlock()
+		delayMs := float64(firstResponseDelay(base, time.Now(), c.dialLatency)) / float64(time.Millisecond)
 		c.smart.reportLatency(c.proxyName, c.metadata, delayMs)
 	})
 }

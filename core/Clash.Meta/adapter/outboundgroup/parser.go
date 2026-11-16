@@ -169,7 +169,9 @@ func ParseProxyGroup(config map[string]any, proxyMap map[string]C.Proxy, provide
 		// select don't need auto health check
 		if groupOption.Type != "select" && groupOption.Type != "relay" {
 			if groupOption.Type == "smart" {
-				// smart groups always retest on a fixed 5-minute schedule
+				// proxies-based smart groups always retest on a fixed 5-minute
+				// schedule; use-based groups follow the provider health-check
+				// settings instead.
 				groupOption.Interval = 300
 			} else if groupOption.Interval == 0 {
 				groupOption.Interval = 300

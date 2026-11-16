@@ -304,7 +304,8 @@ const urlTestBaseOption = {
   hidden: true,
 };
 
-// smart 组固定每 5 分钟重测，interval / lazy / tolerance 对它无效，因此单独定义
+// smart 组（proxies 方式）由解析器固定 300s 重测间隔，interval 无效；lazy 仍按默认值生效，
+// tolerance 被忽略，因此单独定义
 const smartBaseOption = {
   ...groupBaseOption,
   type: 'smart',
