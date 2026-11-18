@@ -4,7 +4,7 @@
  * 自定义分流远程规则集：@appshubcc https://github.com/appshubcc/bett-rules 
  */
 
-// @version 2026111806
+// @version 2026111807
 const Compatible_With_Bettbox = { ruleOptionsEnable: true };
 
 const ruleOptionsEnable = {
@@ -368,6 +368,8 @@ const serviceConfigs = [
   {
     name: 'YouTube',
     baseOption: selectBaseOption,
+    // 内置分流项直接带上服务键，开启「智能选择」后同样派生子组。
+    service: 'youtube',
     providers: {
       youtube: {
         ...ruleProviderCommonDomain,
@@ -966,6 +968,7 @@ function buildRegionGroups(filteredProxies) {
 const serviceConnectivityTags = {
   openai: 'openai',
   'google-gemini': 'google-gemini',
+  youtube: 'youtube',
 };
 
 function serviceKeyOfSets(sets) {
@@ -1209,11 +1212,23 @@ function buildFunctionalGroups(filteredProxies, generatedRegionGroups) {
     }
 
     // 命中已知服务的分流项在开启「智能选择」后附带一个 smart 子组，由内核按服务
-    // 连通性把不可用地区的节点排到后面，避免香港这类节点抢到 ChatGPT 流量。
-    const serviceSmartName =
-      svc.smartName && !svc.includeAll && !svc.reject && ruleOptionsEnable['智能选择'] && allProxiesNames.length
-        ? svc.smartName
-        : null;
+    // 连通性把不可用节点排到后面。自定义分流项在 buildCustomServices 里已经拿到
+    // smartName；内置分流项（如 YouTube）在这里补上，并让先占用的名字优先。
+    let serviceSmartName = svc.smartName ?? null;
+    if (
+      !serviceSmartName &&
+      svc.service &&
+      !svc.includeAll &&
+      !svc.reject &&
+      ruleOptionsEnable['智能选择'] &&
+      allProxiesNames.length
+    ) {
+      const derived = `${svc.name}-智能选择`;
+      if (!reservedNames.has(derived)) {
+        serviceSmartName = derived;
+        reservedNames.add(derived);
+      }
+    }
     if (serviceSmartName) {
       functionalGroups.push({
         ...smartBaseOption,

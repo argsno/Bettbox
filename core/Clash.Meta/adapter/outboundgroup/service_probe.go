@@ -31,8 +31,15 @@ type servicePreset struct {
 	url string
 	// trace reads Cloudflare's /cdn-cgi/trace key=value body; otherwise the body
 	// is a service page that only reveals the region through its payload.
-	trace   bool
-	blocked map[string]struct{}
+	trace bool
+	// regionPatterns extract the region from a page body; the first match wins.
+	regionPatterns []*regexp.Regexp
+	// blockedPaths mark a redirect target as unusable even when it answers 200.
+	blockedPaths []string
+	// unavailablePhrases mark a 200 page as unusable; matched against the lower
+	// cased body.
+	unavailablePhrases []string
+	blocked            map[string]struct{}
 }
 
 var servicePresets = map[string]servicePreset{
@@ -45,21 +52,53 @@ var servicePresets = map[string]servicePreset{
 		),
 	},
 	"google-gemini": {
-		url: "https://gemini.google.com/",
+		url:            "https://gemini.google.com/",
+		regionPatterns: geminiRegionPatterns,
+		blockedPaths:   []string{"sorry.google.com"},
+		unavailablePhrases: []string{
+			"not supported in your country",
+			"isn't supported in your country",
+			"not available in your country",
+			"unavailable in your country",
+			"not currently supported",
+			"isn't currently supported",
+			"不支持您所在的国家",
+			"不支持你所在的国家",
+			"无法在您所在的国家",
+			"無法在您所在的國家",
+			"ご利用いただけません",
+		},
 		blocked: serviceRegionSet(
 			"CN", "CHN", "RU", "RUS", "BY", "BLR", "IR", "IRN", "KP", "PRK",
 			"SY", "SYR", "CU", "CUB", "VE", "VEN", "MM", "MMR", "SD", "SDN",
 			"AF", "AFG", "SS", "SSD", "YE", "YEM", "ZW", "ZWE",
 		),
 	},
+	// YouTube is not refused by region: a member only fails when the request
+	// itself lands on an unavailable page. The region stays for logging and for
+	// the app's unlock panel, so the preset keeps no blocked region.
+	"youtube": {
+		url:            "https://www.youtube.com/premium",
+		regionPatterns: youtubeRegionPatterns,
+		blockedPaths:   []string{"sorry.google.com", "www.google.cn"},
+		unavailablePhrases: []string{
+			"youtube isn't available in your country",
+			"youtube is not available in your country",
+			"youtube is unavailable in your country",
+			"www.google.cn",
+		},
+		blocked: serviceRegionSet(),
+	},
 }
 
 var serviceAliases = map[string]string{
-	"":              "",
-	"openai":        "openai",
-	"chatgpt":       "openai",
-	"google-gemini": "google-gemini",
-	"gemini":        "google-gemini",
+	"":               "",
+	"openai":         "openai",
+	"chatgpt":        "openai",
+	"google-gemini":  "google-gemini",
+	"gemini":         "google-gemini",
+	"youtube":        "youtube",
+	"google-youtube": "youtube",
 }
 
 func serviceRegionSet(regions ...string) map[string]struct{} {
@@ -96,18 +135,10 @@ var geminiRegionPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`\[1,null,null,\d+,\d+,"([A-Z]{3})"`),
 }
 
-var geminiUnavailablePhrases = []string{
-	"not supported in your country",
-	"isn't supported in your country",
-	"not available in your country",
-	"unavailable in your country",
-	"not currently supported",
-	"isn't currently supported",
-	"不支持您所在的国家",
-	"不支持你所在的国家",
-	"无法在您所在的国家",
-	"無法在您所在的國家",
-	"ご利用いただけません",
+var youtubeRegionPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`"INNERTUBE_CONTEXT_GL"\s*:\s*"([A-Z]{2})"`),
+	regexp.MustCompile(`"countryCode"\s*:\s*"([A-Z]{2})"`),
+	regexp.MustCompile(`"REQUEST_DOMAIN"\s*:\s*"([a-zA-Z]{2})"`),
 }
 
 func parseTraceBody(body string) (ip, loc, colo string, warp bool) {
@@ -151,22 +182,30 @@ func evaluateServiceResponse(preset servicePreset, status int, finalURL, body st
 		return verdict
 	}
 
-	for _, pattern := range geminiRegionPatterns {
+	for _, pattern := range preset.regionPatterns {
 		if match := pattern.FindStringSubmatch(body); match != nil {
-			verdict.region = match[1]
+			verdict.region = strings.ToUpper(match[1])
 			break
 		}
 	}
 	verdict.known = true
-	lowerBody := strings.ToLower(body)
-	_, blockedRegion := preset.blocked[strings.ToUpper(verdict.region)]
-	if status != 200 ||
-		strings.Contains(finalURL, "sorry.google.com") ||
-		blockedRegion {
+	if status != 200 {
 		verdict.blocked = true
 		return verdict
 	}
-	for _, phrase := range geminiUnavailablePhrases {
+	lowerURL := strings.ToLower(finalURL)
+	for _, path := range preset.blockedPaths {
+		if path != "" && strings.Contains(lowerURL, strings.ToLower(path)) {
+			verdict.blocked = true
+			return verdict
+		}
+	}
+	if _, blockedRegion := preset.blocked[strings.ToUpper(verdict.region)]; blockedRegion {
+		verdict.blocked = true
+		return verdict
+	}
+	lowerBody := strings.ToLower(body)
+	for _, phrase := range preset.unavailablePhrases {
 		if strings.Contains(lowerBody, phrase) {
 			verdict.blocked = true
 			return verdict

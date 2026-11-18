@@ -613,88 +613,6 @@ class MediaUnlockChecker {
     }
   }
 
-  Future<MediaUnlockResult> checkYouTube() async {
-    final sw = Stopwatch()..start();
-    final dio = _createDio(followRedirects: true);
-    try {
-      final res = await dio.get<ResponseBody>(
-        'https://www.youtube.com/premium',
-        options: Options(
-          responseType: ResponseType.stream,
-          receiveTimeout: const Duration(seconds: 4),
-          sendTimeout: const Duration(seconds: 4),
-        ),
-      );
-      final realUrl = res.realUri.toString();
-      if (realUrl.contains('sorry.google.com')) {
-        return MediaUnlockResult(
-          platform: MediaPlatform.youtube,
-          status: MediaUnlockStatus.blocked,
-          latency: sw.elapsedMilliseconds,
-        );
-      }
-
-      final responseBody = res.data;
-      final chunks = <int>[];
-      if (responseBody != null) {
-        try {
-          await for (final chunk in responseBody.stream) {
-            chunks.addAll(chunk);
-            if (chunks.length >= 150 * 1024) break;
-            final currentStr = utf8.decode(chunks, allowMalformed: true);
-            if (currentStr.contains('"INNERTUBE_CONTEXT_GL"') ||
-                currentStr.contains('Premium is not available') ||
-                currentStr.contains('unavailable in your country')) {
-              break;
-            }
-          }
-        } catch (_) {}
-      }
-
-      final MediaUnlockStatus status;
-      String? region;
-      if (res.statusCode == 200) {
-        final body = utf8.decode(chunks, allowMalformed: true);
-        final glMatch = RegExp(
-          r'"INNERTUBE_CONTEXT_GL"\s*:\s*"([A-Z]{2})"',
-        ).firstMatch(body);
-        final ccMatch = RegExp(
-          r'"countryCode"\s*:\s*"([A-Z]{2})"',
-        ).firstMatch(body);
-        final reqDomainMatch = RegExp(
-          r'"REQUEST_DOMAIN"\s*:\s*"([a-zA-Z]{2})"',
-        ).firstMatch(body);
-        region =
-            glMatch?.group(1) ??
-            ccMatch?.group(1) ??
-            reqDomainMatch?.group(1)?.toUpperCase();
-
-        if (body.contains('Premium is not available in your country') ||
-            body.contains('unavailable in your country')) {
-          status = MediaUnlockStatus.flagged;
-        } else {
-          status = MediaUnlockStatus.unlocked;
-        }
-      } else {
-        status = MediaUnlockStatus.blocked;
-      }
-      return MediaUnlockResult(
-        platform: MediaPlatform.youtube,
-        status: status,
-        region: region,
-        latency: sw.elapsedMilliseconds,
-      );
-    } catch (_) {
-      return MediaUnlockResult(
-        platform: MediaPlatform.youtube,
-        status: MediaUnlockStatus.failed,
-        latency: sw.elapsedMilliseconds,
-      );
-    } finally {
-      dio.close(force: true);
-    }
-  }
-
   Future<MediaUnlockResult> checkYouTubeMusic() async {
     final sw = Stopwatch()..start();
     final dio = _createDio(followRedirects: true);
@@ -1083,13 +1001,17 @@ class MediaUnlockChecker {
     }
   }
 
-  Future<MediaUnlockResult> _checkGeminiPage(HtmlRegionProbe probe) async {
+  Future<MediaUnlockResult> _checkHtmlRegionPage(
+    MediaPlatform platform,
+    HtmlRegionProbe probe,
+  ) async {
     final sw = Stopwatch()..start();
     final dio = _createDio(followRedirects: true);
     try {
-      final res = await dio.get<String>(
-        'https://gemini.google.com/',
+      final res = await dio.get<ResponseBody>(
+        probe.url,
         options: Options(
+          responseType: ResponseType.stream,
           receiveTimeout: const Duration(seconds: 6),
           sendTimeout: const Duration(seconds: 6),
           headers: {
@@ -1111,64 +1033,58 @@ class MediaUnlockChecker {
         ),
       );
       final realUrl = res.realUri.toString();
-      if (realUrl.contains('sorry.google.com')) {
-        return MediaUnlockResult(
-          platform: MediaPlatform.gemini,
-          status: MediaUnlockStatus.blocked,
-          latency: sw.elapsedMilliseconds,
-        );
+      final lowerUrl = realUrl.toLowerCase();
+      final chunks = <int>[];
+      if (res.data case final data?) {
+        try {
+          await for (final chunk in data.stream) {
+            chunks.addAll(chunk);
+            if (probe.maxBody > 0 && chunks.length >= probe.maxBody) break;
+          }
+        } catch (_) {}
       }
+      final body = utf8.decode(chunks, allowMalformed: true);
+      final lowerBody = body.toLowerCase();
 
-      final body = res.data ?? '';
-      final regMatch = RegExp(r',2,1,200,"([A-Z]{3})"').firstMatch(body);
-      final altMatch = RegExp(
-        r'\[1,null,null,\d+,\d+,"([A-Z]{3})"',
-      ).firstMatch(body);
-      final rawRegion = regMatch?.group(1) ?? altMatch?.group(1);
+      String? rawRegion;
+      for (final pattern in probe.regionPatterns) {
+        final match = RegExp(pattern).firstMatch(body);
+        if (match != null) {
+          rawRegion = match.group(1);
+          break;
+        }
+      }
       final region = rawRegion != null
           ? utils.normalizeRegion(rawRegion)
           : null;
 
-      final lowerBody = body.toLowerCase();
-      final hasFeatureFlag =
-          body.contains('"45631641":true') ||
-          body.contains('45631641,null,true');
-      final isUnavailable =
-          realUrl.contains('unavailable') ||
-          lowerBody.contains('not supported in your country') ||
-          lowerBody.contains("isn't supported in your country") ||
-          lowerBody.contains('not available in your country') ||
-          lowerBody.contains('unavailable in your country') ||
-          lowerBody.contains('not currently supported') ||
-          lowerBody.contains("isn't currently supported") ||
-          body.contains('不支持您所在的国家') ||
-          body.contains('不支持你所在的国家') ||
-          body.contains('无法在您所在的国家') ||
-          body.contains('無法在您所在的國家') ||
-          body.contains('ご利用いただけません');
-
       final isBlockedRegion =
           (region != null && probe.blockedRegions.contains(region)) ||
           (rawRegion != null && probe.blockedRegions.contains(rawRegion));
+      final isBlockedPath = probe.blockedPaths.any(lowerUrl.contains);
+      final isUnavailable = probe.unavailablePhrases.any(lowerBody.contains);
 
       final MediaUnlockStatus status;
-      if (res.statusCode != 200 || isUnavailable || isBlockedRegion) {
+      if (res.statusCode != 200 ||
+          isBlockedPath ||
+          isBlockedRegion ||
+          isUnavailable) {
         status = MediaUnlockStatus.blocked;
-      } else if (hasFeatureFlag || region != null || res.statusCode == 200) {
-        status = MediaUnlockStatus.unlocked;
+      } else if (probe.limitedPhrases.any(lowerBody.contains)) {
+        status = MediaUnlockStatus.flagged;
       } else {
-        status = MediaUnlockStatus.blocked;
+        status = MediaUnlockStatus.unlocked;
       }
 
       return MediaUnlockResult(
-        platform: MediaPlatform.gemini,
+        platform: platform,
         status: status,
         region: region,
         latency: sw.elapsedMilliseconds,
       );
     } catch (_) {
       return MediaUnlockResult(
-        platform: MediaPlatform.gemini,
+        platform: platform,
         status: MediaUnlockStatus.failed,
         latency: sw.elapsedMilliseconds,
       );
@@ -1594,7 +1510,7 @@ class MediaUnlockChecker {
             : probe.blockedRegions,
         fallbackUrl: probe.fallbackUrl,
       ),
-      HtmlRegionProbe probe => _checkGeminiPage(probe),
+      HtmlRegionProbe probe => _checkHtmlRegionPage(type.platform, probe),
     };
   }
 
@@ -1603,7 +1519,9 @@ class MediaUnlockChecker {
     return runZoned(
       () {
         final checkFuture = switch (platform) {
-      MediaPlatform.openai || MediaPlatform.gemini => _checkServiceType(
+      MediaPlatform.openai ||
+      MediaPlatform.gemini ||
+      MediaPlatform.youtube => _checkServiceType(
         serviceTypeByPlatform[platform]!,
       ),
       MediaPlatform.claude => _checkCloudflareTrace(
@@ -1637,7 +1555,6 @@ class MediaUnlockChecker {
       ),
       MediaPlatform.netflix => checkNetflix(),
       MediaPlatform.disney => checkDisney(),
-      MediaPlatform.youtube => checkYouTube(),
       MediaPlatform.youtubemusic => checkYouTubeMusic(),
       MediaPlatform.spotify => checkSpotify(),
       MediaPlatform.tiktok => checkTikTok(),

@@ -37,8 +37,9 @@ void main() {
             for (final host in probe.hosts) {
               expect(host, isNot(contains('/')), reason: '${type.key} 只写域名');
             }
-          case HtmlRegionProbe():
-            break;
+          case HtmlRegionProbe probe:
+            expect(probe.url, isNotEmpty, reason: type.key);
+            expect(probe.regionPatterns, isNotEmpty, reason: type.key);
         }
       }
     });
@@ -66,6 +67,26 @@ void main() {
       expect(probe.blockedRegions, isNot(contains('USA')));
     });
 
+    test('YouTube 只按请求能否成功探测，不按地区降级', () {
+      final type = serviceTypeByKey['youtube']!;
+      expect(type.platform, MediaPlatform.youtube);
+      expect(type.category, RouteCategory.streaming);
+      expect(type.sets, contains('geosite:youtube'));
+
+      final probe = type.probe as HtmlRegionProbe;
+      expect(probe.url, 'https://www.youtube.com/premium');
+      expect(probe.blockedRegions, isEmpty);
+      expect(
+        probe.blockedPaths,
+        containsAll(['sorry.google.com', 'www.google.cn']),
+      );
+      expect(probe.unavailablePhrases, isNotEmpty);
+      expect(
+        probe.limitedPhrases,
+        contains('premium is not available in your country'),
+      );
+    });
+
     test('地区黑名单与内核 service_probe.go 一致', () {
       final source = File(
         'core/Clash.Meta/adapter/outboundgroup/service_probe.go',
@@ -85,6 +106,7 @@ void main() {
 
       expect(goRegions('openai'), openaiBlockedRegions);
       expect(goRegions('google-gemini'), geminiBlockedRegions);
+      expect(goRegions('youtube'), youtubeBlockedRegions);
     });
 
     test('规则集在 routing.json 里都存在', () {

@@ -11,12 +11,15 @@ import (
 
 func TestNormalizeServiceName(t *testing.T) {
 	cases := map[string]string{
-		"":              "",
-		"openai":        "openai",
-		"OpenAI":        "openai",
-		" chatgpt ":     "openai",
-		"gemini":        "google-gemini",
-		"google-gemini": "google-gemini",
+		"":               "",
+		"openai":         "openai",
+		"OpenAI":         "openai",
+		" chatgpt ":      "openai",
+		" gemini ":       "google-gemini",
+		"google-gemini":  "google-gemini",
+		"youtube":        "youtube",
+		"YouTube":        "youtube",
+		"google-youtube": "youtube",
 	}
 	for input, want := range cases {
 		got, err := normalizeServiceName(input)
@@ -104,6 +107,57 @@ func TestEvaluateGeminiPage(t *testing.T) {
 	forbidden := evaluateServiceResponse(preset, 403, "https://gemini.google.com/app", "")
 	if !forbidden.known || !forbidden.blocked {
 		t.Fatalf("an anti-bot page must count as unusable, got %+v", forbidden)
+	}
+}
+
+func TestEvaluateYouTubePage(t *testing.T) {
+	preset := servicePresets["youtube"]
+
+	allowed := evaluateServiceResponse(preset, 200, "https://www.youtube.com/premium", `"INNERTUBE_CONTEXT_GL":"US"`)
+	if !allowed.known || allowed.blocked || allowed.region != "US" {
+		t.Fatalf("a US page must be allowed, got %+v", allowed)
+	}
+
+	// The media panel flags a missing Premium subscription, but videos still
+	// play there; routing must not demote the member for that.
+	premium := evaluateServiceResponse(preset, 200, "https://www.youtube.com/premium", "Premium is not available in your country")
+	if !premium.known || premium.blocked {
+		t.Fatalf("a missing Premium offer must not demote the member, got %+v", premium)
+	}
+
+	redirected := evaluateServiceResponse(preset, 200, "https://sorry.google.com/sorry/index", "")
+	if !redirected.blocked {
+		t.Fatalf("sorry.google.com must be blocked, got %+v", redirected)
+	}
+
+	cnRedirect := evaluateServiceResponse(preset, 200, "https://www.google.cn/", "")
+	if !cnRedirect.blocked {
+		t.Fatalf("a www.google.cn redirect must be blocked, got %+v", cnRedirect)
+	}
+
+	cnBody := evaluateServiceResponse(preset, 200, "https://www.youtube.com/premium", "<a href='https://www.google.cn/'>YouTube</a>")
+	if !cnBody.blocked {
+		t.Fatalf("a www.google.cn body must be blocked, got %+v", cnBody)
+	}
+
+	unavailable := evaluateServiceResponse(preset, 200, "https://www.youtube.com/premium", "YouTube isn't available in your country")
+	if !unavailable.blocked {
+		t.Fatalf("an unavailable page must be blocked, got %+v", unavailable)
+	}
+
+	errorStatus := evaluateServiceResponse(preset, 503, "https://www.youtube.com/premium", "")
+	if errorStatus.known || errorStatus.blocked {
+		t.Fatalf("a 5xx answer is undecidable, got %+v", errorStatus)
+	}
+
+	rateLimited := evaluateServiceResponse(preset, 429, "https://www.youtube.com/premium", "")
+	if rateLimited.known || rateLimited.blocked {
+		t.Fatalf("a 429 answer is undecidable, got %+v", rateLimited)
+	}
+
+	forbidden := evaluateServiceResponse(preset, 403, "https://www.youtube.com/premium", "")
+	if !forbidden.known || !forbidden.blocked {
+		t.Fatalf("a 403 page must count as unusable, got %+v", forbidden)
 	}
 }
 
@@ -240,5 +294,13 @@ func TestNewSmartServiceOption(t *testing.T) {
 	}
 	if s.service != "google-gemini" {
 		t.Fatalf("service alias not normalized: %q", s.service)
+	}
+
+	y, err := NewSmart(GroupCommonOption{Name: "smart"}, SmartOption{Service: "YouTube"}, nil, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if y.service != "youtube" {
+		t.Fatalf("service alias not normalized: %q", y.service)
 	}
 }

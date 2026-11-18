@@ -239,9 +239,100 @@ void main() {
     expect(group(config, '默认代理')['proxies'], contains('订阅 C'));
   });
 
+  test('built-in YouTube group gets a service smart subgroup', () async {
+    final config = await generate({'智能选择': true});
+
+    expect(groupTypes(config), contains('YouTube-智能选择:smart'));
+    final types = groupTypes(config);
+    expect(
+      types.indexOf('YouTube-智能选择:smart'),
+      lessThan(types.indexOf('YouTube:select')),
+    );
+    final smart = group(config, 'YouTube-智能选择');
+    expect(smart['service'], 'youtube');
+    expect(smart['proxies'], ['🇭🇰 HK 01', '🇭🇰 HK 02']);
+    final youtube = group(config, 'YouTube');
+    expect(youtube['proxies'], [
+      'YouTube-智能选择',
+      '默认代理',
+      '手动选择',
+      '智能选择',
+      '香港',
+    ]);
+    expect(youtube['default-selected'], 'YouTube-智能选择');
+  });
+
+  test('built-in YouTube group stays unchanged without smart select', () async {
+    final config = await generate({'自动选择': true});
+
+    expect(groupTypes(config), contains('YouTube:select'));
+    expect(groupTypes(config), isNot(contains('YouTube-智能选择:smart')));
+    expect(group(config, 'YouTube')['proxies'], [
+      '默认代理',
+      '手动选择',
+      '自动选择',
+      '香港',
+    ]);
+    expect(group(config, 'YouTube').containsKey('service'), false);
+    expect(group(config, 'YouTube').containsKey('default-selected'), false);
+  });
+
+  test('built-in YouTube subgroup follows the YouTube switch', () async {
+    final config = await generate({'智能选择': true, 'YouTube': false});
+
+    expect(groupTypes(config), isNot(contains('YouTube:select')));
+    expect(groupTypes(config), isNot(contains('YouTube-智能选择:smart')));
+  });
+
+  test('built-in YouTube subgroup sorts before its parent', () async {
+    final config = await generate(
+      {'智能选择': true},
+      prelude: "const bettboxOrder = ['YouTube','YouTube-智能选择'];",
+    );
+
+    final types = groupTypes(config);
+    expect(
+      types.indexOf('YouTube-智能选择:smart'),
+      lessThan(types.indexOf('YouTube:select')),
+      reason: 'proxy group order: $types',
+    );
+  });
+
+  test('built-in YouTube subgroup yields to a same-named route', () async {
+    const clashRoute =
+        "{'name':'YouTube-智能选择','sets':[{'type':'geosite','tag':'youtube'}],'target':'直连'}";
+    final config = await generate(
+      {'智能选择': true},
+      prelude: 'const bettboxRoutes = [$clashRoute];',
+    );
+
+    final names = [for (final group in groups(config)) group['name'] as String];
+    expect(
+      names.toSet().length,
+      names.length,
+      reason: 'duplicate proxy group names: $names',
+    );
+    expect(
+      group(config, 'YouTube')['proxies'],
+      isNot(contains('YouTube-智能选择')),
+    );
+  });
+
   const chatGPTRoute =
       "{'name':'ChatGPT','sets':[{'type':'geosite','tag':'openai'}],'target':'直连'}";
   const chatGPTRoutePrelude = 'const bettboxRoutes = [$chatGPTRoute];';
+
+  test('custom YouTube route gets a service smart subgroup', () async {
+    const youtubeRoute =
+        "{'name':'YouTube 自定义','sets':[{'type':'geosite','tag':'youtube'}],'target':'直连'}";
+    final config = await generate(
+      {'智能选择': true},
+      prelude: 'const bettboxRoutes = [$youtubeRoute];',
+    );
+
+    expect(groupTypes(config), contains('YouTube 自定义-智能选择:smart'));
+    expect(group(config, 'YouTube 自定义-智能选择')['service'], 'youtube');
+  });
 
   test('custom service route gets a smart subgroup', () async {
     final config = await generate({'智能选择': true}, prelude: chatGPTRoutePrelude);
@@ -345,7 +436,7 @@ void main() {
     final config = await generate(
       {'智能选择': true},
       prelude:
-          "const bettboxRoutes = [$chatGPTRoute,$clashRoute];\n"
+          'const bettboxRoutes = [$chatGPTRoute,$clashRoute];\n'
           "const bettboxOrder = ['ChatGPT','ChatGPT-智能选择'];",
     );
 
