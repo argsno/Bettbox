@@ -210,8 +210,11 @@ func TestSmartApplyProbeOutcomes(t *testing.T) {
 	if !blockedA {
 		t.Fatal("an undecidable probe must not lift the previous blocked verdict")
 	}
-	if attemptA.IsZero() || attemptB.IsZero() {
+	if attemptA.at.IsZero() || attemptB.at.IsZero() {
 		t.Fatal("every probed member must record an attempt, verdict or not")
+	}
+	if attemptA.misses != 1 || attemptB.misses != 1 {
+		t.Fatalf("an undecidable answer and a failed request must each count a miss, got %d and %d", attemptA.misses, attemptB.misses)
 	}
 
 	s.mu.Lock()
@@ -221,12 +224,17 @@ func TestSmartApplyProbeOutcomes(t *testing.T) {
 	}, s.Proxies(), now)
 	clearedA := s.serviceBlockedLocked("a", now)
 	blockedB := s.serviceBlockedLocked("b", now)
+	missesA := s.attempts["a"].misses
+	missesB := s.attempts["b"].misses
 	s.mu.Unlock()
 	if clearedA {
 		t.Fatal("a known allowed verdict must lift the demotion")
 	}
 	if !blockedB {
 		t.Fatal("a known blocked verdict must be recorded")
+	}
+	if missesA != 0 || missesB != 0 {
+		t.Fatalf("a decidable answer must reset the miss streak, got %d and %d", missesA, missesB)
 	}
 }
 
@@ -235,7 +243,7 @@ func TestSmartApplyProbeOutcomesPrunesGoneMembers(t *testing.T) {
 	s.service = "openai"
 	now := time.Now()
 	s.verdicts["ghost"] = serviceVerdict{at: now, known: true, blocked: true}
-	s.attempts["ghost"] = now
+	s.attempts["ghost"] = serviceProbeAttempt{at: now, misses: 2}
 
 	s.mu.Lock()
 	s.applyProbeOutcomesLocked(map[string]serviceProbeOutcome{
@@ -281,15 +289,26 @@ func TestSmartSelectServiceProbeMembers(t *testing.T) {
 
 	// A recent attempt that produced no verdict backs the member off.
 	s.mu.Lock()
-	s.attempts["Slow"] = now
+	s.attempts["Slow"] = serviceProbeAttempt{at: now}
 	s.mu.Unlock()
 	if got := selectNames(); len(got) != 0 {
 		t.Fatalf("a recent failed attempt must back the member off, got %v", got)
 	}
 
-	// Once both the retry and the refresh window lapse, the member returns.
+	// Two consecutive misses double the backoff to ten minutes: six minutes
+	// after the last attempt the member is still waiting, where the flat
+	// five-minute window would already have let it back.
 	s.mu.Lock()
-	s.attempts["Slow"] = now.Add(-serviceProbeRetry - time.Second)
+	s.attempts["Slow"] = serviceProbeAttempt{at: now.Add(-6 * time.Minute), misses: 2}
+	s.verdicts["Alive"] = serviceVerdict{at: now, known: true}
+	s.mu.Unlock()
+	if got := selectNames(); len(got) != 0 {
+		t.Fatalf("a doubled backoff must keep the member waiting, got %v", got)
+	}
+
+	// Once the backoff window lapses, the member returns.
+	s.mu.Lock()
+	s.attempts["Slow"] = serviceProbeAttempt{at: now.Add(-2*serviceProbeRetry - time.Minute)}
 	s.verdicts["Alive"] = serviceVerdict{at: now.Add(-serviceVerdictRefresh - time.Second), known: true}
 	s.mu.Unlock()
 	if got, want := selectNames(), []string{"Alive", "Slow"}; !slices.Equal(got, want) {
@@ -532,5 +551,64 @@ func TestNewSmartServiceOption(t *testing.T) {
 	}
 	if y.service != "youtube" {
 		t.Fatalf("service alias not normalized: %q", y.service)
+	}
+}
+
+func TestSmartServiceProbeBackoffSchedule(t *testing.T) {
+	cases := []struct {
+		misses int
+		want   time.Duration
+	}{
+		{0, serviceProbeRetry},
+		{1, serviceProbeRetry},
+		{2, 2 * serviceProbeRetry},
+		{3, 4 * serviceProbeRetry},
+		{4, serviceProbeRetryMax},
+		{5, serviceProbeRetryMax},
+		{6, serviceProbeRetryMax},
+		{9, serviceProbeRetryMax},
+	}
+	for _, tc := range cases {
+		if got := (serviceProbeAttempt{misses: tc.misses}).backoff(); got != tc.want {
+			t.Fatalf("backoff(%d) = %v, want %v", tc.misses, got, tc.want)
+		}
+	}
+}
+
+func TestSmartBlockedVerdictTrustedDuringBackoff(t *testing.T) {
+	s := newTestSmartWithProxies(newFakeProxy("a", 100))
+	s.service = "openai"
+	now := time.Now()
+
+	// A fresh blocked verdict demotes as usual.
+	fresh := serviceVerdict{at: now, known: true, blocked: true}
+	// The blocked verdict is older than its TTL, but the member's probes keep
+	// failing to produce a decidable answer: the demotion must persist.
+	expired := serviceVerdict{at: now.Add(-serviceVerdictTTL - time.Minute), known: true, blocked: true}
+	s.mu.Lock()
+	s.verdicts["a"] = fresh
+	trusted := s.serviceBlockedLocked("a", now)
+	s.verdicts["a"] = expired
+	s.attempts["a"] = serviceProbeAttempt{at: now.Add(-time.Minute), misses: 2}
+	trustedDuringBackoff := s.serviceBlockedLocked("a", now)
+	s.attempts["a"] = serviceProbeAttempt{at: now.Add(-serviceProbeRetryMax - time.Minute), misses: 2}
+	lapsed := s.serviceBlockedLocked("a", now)
+	// An allowed verdict gets no such extension: an expired allowed member is
+	// simply no longer boosted, and misses never demote it.
+	s.verdicts["a"] = serviceVerdict{at: expired.at, known: true}
+	allowed := s.serviceBlockedLocked("a", now)
+	s.mu.Unlock()
+
+	if !trusted {
+		t.Fatal("test setup: a fresh blocked verdict must demote")
+	}
+	if !trustedDuringBackoff {
+		t.Fatal("an expired blocked verdict must stay trusted while the probe keeps failing")
+	}
+	if lapsed {
+		t.Fatal("the extended trust must lapse with the backoff window")
+	}
+	if allowed {
+		t.Fatal("an expired allowed verdict must never demote, misses or not")
 	}
 }

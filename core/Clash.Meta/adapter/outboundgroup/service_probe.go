@@ -33,9 +33,11 @@ const (
 	// serviceVerdictTTL is how long a verdict is trusted for ranking when no
 	// newer answer arrives (the group is idle or the probes keep failing).
 	serviceVerdictTTL = 20 * time.Minute
-	// serviceProbeRetry backs off a member whose last attempt produced no
-	// verdict, so an unreachable member is not retried on every connection.
-	serviceProbeRetry = 5 * time.Minute
+	// serviceProbeRetry paces the retry of a member whose last attempt produced
+	// no decidable answer; consecutive misses double it up to serviceProbeRetryMax,
+	// so an unreachable member is relearned quickly at first and rarely later.
+	serviceProbeRetry    = 5 * time.Minute
+	serviceProbeRetryMax = 40 * time.Minute
 	// serviceProbeBatch caps one run; deeper members wait for later runs, so
 	// the probe budget follows the ranking instead of the roster.
 	serviceProbeBatch = 12
@@ -151,6 +153,30 @@ type serviceVerdict struct {
 type serviceProbeOutcome struct {
 	verdict serviceVerdict
 	done    bool
+}
+
+// serviceProbeAttempt records a member's last probe try, decidable or not.
+// misses counts the consecutive tries that produced no decidable answer and
+// drives the exponential backoff; a decidable answer resets it.
+type serviceProbeAttempt struct {
+	at     time.Time
+	misses int
+}
+
+// backoff doubles serviceProbeRetry per consecutive miss, capped at
+// serviceProbeRetryMax.
+func (a serviceProbeAttempt) backoff() time.Duration {
+	if a.misses <= 1 {
+		return serviceProbeRetry
+	}
+	backoff := serviceProbeRetry
+	for i := 1; i < a.misses; i++ {
+		backoff *= 2
+		if backoff >= serviceProbeRetryMax {
+			return serviceProbeRetryMax
+		}
+	}
+	return backoff
 }
 
 var geminiRegionPatterns = []*regexp.Regexp{
@@ -332,7 +358,7 @@ func (s *Smart) selectServiceProbeMembersLocked(proxies []C.Proxy, now time.Time
 			fresh++
 			continue
 		}
-		if attempt, ok := s.attempts[name]; ok && now.Sub(attempt) < serviceProbeRetry {
+		if attempt, ok := s.attempts[name]; ok && now.Sub(attempt.at) < attempt.backoff() {
 			continue
 		}
 		// A member whose URL test failed cannot be picked anyway; its verdict
@@ -408,9 +434,13 @@ func (s *Smart) applyProbeOutcomesLocked(outcomes map[string]serviceProbeOutcome
 	}
 	for name, outcome := range outcomes {
 		if s.attempts == nil {
-			s.attempts = make(map[string]time.Time, len(outcomes))
+			s.attempts = make(map[string]serviceProbeAttempt, len(outcomes))
 		}
-		s.attempts[name] = now
+		attempt := serviceProbeAttempt{at: now}
+		if !(outcome.done && outcome.verdict.known) {
+			attempt.misses = s.attempts[name].misses + 1
+		}
+		s.attempts[name] = attempt
 		if outcome.done && outcome.verdict.known {
 			if s.verdicts == nil {
 				s.verdicts = make(map[string]serviceVerdict, len(outcomes))
@@ -441,6 +471,16 @@ func (s *Smart) serviceBlockedLocked(name string, now time.Time) bool {
 		return false
 	}
 	if now.Sub(verdict.at) > serviceVerdictTTL {
+		// A blocked verdict stays trusted while the member's probes keep
+		// failing to produce a decidable answer: resurrecting it between
+		// attempts would route traffic to a member the last real answer
+		// refused. The trust lapses with the backoff window, so an idle group
+		// re-learns the member once probes resume.
+		if verdict.blocked {
+			if attempt, ok := s.attempts[name]; ok && attempt.misses > 0 && now.Sub(attempt.at) < attempt.backoff() {
+				return true
+			}
+		}
 		return false
 	}
 	return verdict.blocked

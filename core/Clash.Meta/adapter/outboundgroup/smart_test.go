@@ -77,22 +77,56 @@ func (f *fakeProxy) ListenPacketContext(ctx context.Context, metadata *C.Metadat
 	return &fakePacketConn{}, nil
 }
 
-// fakePacketConn implements C.PacketConn so packet retry tests can observe the
-// success path without a real socket.
+// fakePacketConn implements C.PacketConn so packet tests can observe the
+// wrapper without a real socket: reads drain readData (ReadFrom one chunk at
+// a time, WaitReadFrom in one go), writes are counted, Close only counts.
 type fakePacketConn struct {
-	chains []C.ProxyAdapter
+	chains   []C.ProxyAdapter
+	mu       sync.Mutex
+	readData []byte
+	written  int
+	closes   int
 }
 
-func (f *fakePacketConn) ReadFrom(b []byte) (int, net.Addr, error)     { return 0, nil, io.EOF }
-func (f *fakePacketConn) WriteTo(b []byte, addr net.Addr) (int, error) { return len(b), nil }
-func (f *fakePacketConn) Close() error                                 { return nil }
-func (f *fakePacketConn) LocalAddr() net.Addr                          { return nil }
-func (f *fakePacketConn) SetDeadline(t time.Time) error                { return nil }
-func (f *fakePacketConn) SetReadDeadline(t time.Time) error            { return nil }
-func (f *fakePacketConn) SetWriteDeadline(t time.Time) error           { return nil }
-func (f *fakePacketConn) WaitReadFrom() ([]byte, func(), net.Addr, error) {
-	return nil, nil, nil, io.EOF
+func (f *fakePacketConn) ReadFrom(b []byte) (int, net.Addr, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.readData) == 0 {
+		return 0, nil, io.EOF
+	}
+	n := copy(b, f.readData)
+	f.readData = f.readData[n:]
+	return n, nil, nil
 }
+
+func (f *fakePacketConn) WaitReadFrom() ([]byte, func(), net.Addr, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.readData) == 0 {
+		return nil, nil, nil, io.EOF
+	}
+	data := f.readData
+	f.readData = nil
+	return data, nil, nil, nil
+}
+
+func (f *fakePacketConn) WriteTo(b []byte, addr net.Addr) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.written += len(b)
+	return len(b), nil
+}
+
+func (f *fakePacketConn) Close() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.closes++
+	return nil
+}
+func (f *fakePacketConn) LocalAddr() net.Addr                           { return nil }
+func (f *fakePacketConn) SetDeadline(t time.Time) error                 { return nil }
+func (f *fakePacketConn) SetReadDeadline(t time.Time) error             { return nil }
+func (f *fakePacketConn) SetWriteDeadline(t time.Time) error            { return nil }
 func (f *fakePacketConn) Chains() C.Chain                               { return nil }
 func (f *fakePacketConn) ProviderChains() C.Chain                       { return nil }
 func (f *fakePacketConn) AppendToChains(adapter C.ProxyAdapter)         { f.chains = append(f.chains, adapter) }
@@ -106,7 +140,7 @@ func newTestSmart() *Smart {
 		states:   make(map[string]*smartPolicyState),
 		sites:    make(map[string]*smartSiteRecord),
 		verdicts: make(map[string]serviceVerdict),
-		attempts: make(map[string]time.Time),
+		attempts: make(map[string]serviceProbeAttempt),
 	}
 }
 
@@ -1380,7 +1414,11 @@ func TestSmartListenPacketSkipsNonUDPAndRetries(t *testing.T) {
 	if st := s.states["Working"]; st == nil || st.decayedUsage(time.Now()) <= 0 {
 		t.Fatalf("the successful UDP member must count as used, got %+v", st)
 	}
-	fakePC, ok := pc.(*fakePacketConn)
+	wrapped, ok := pc.(*smartPacketConn)
+	if !ok {
+		t.Fatalf("a UDP session must be wrapped by smartPacketConn, got %#v", pc)
+	}
+	fakePC, ok := wrapped.Upstream().(*fakePacketConn)
 	if !ok || len(fakePC.chains) != 1 {
 		t.Fatalf("the packet connection must be appended to the group chain, got %#v", pc)
 	}
@@ -1460,5 +1498,107 @@ func TestSmartListenPacketWithoutUDPCapability(t *testing.T) {
 	}
 	if nonUDP.listenCalls != 0 || other.listenCalls != 0 {
 		t.Fatalf("non-UDP members must not be dialed, got %d and %d calls", nonUDP.listenCalls, other.listenCalls)
+	}
+}
+
+func TestSmartPacketConnCloseFailureSemantics(t *testing.T) {
+	metadata := &C.Metadata{Host: "udp-close.example.com"}
+
+	t.Run("close before write", func(t *testing.T) {
+		s := newTestSmart()
+		pc := newSmartPacketConn(&fakePacketConn{}, s, "A", metadata, time.Now(), 0)
+
+		if err := pc.Close(); err != nil {
+			t.Fatalf("close failed: %v", err)
+		}
+		if st := s.states["A"]; st != nil {
+			t.Fatalf("a listener closed without any write must not create node state, got %+v", st)
+		}
+		if record := s.sites[getKey(metadata)]; record != nil {
+			t.Fatalf("a listener closed without any write must not record site state, got %+v", record)
+		}
+	})
+
+	t.Run("write then close before read", func(t *testing.T) {
+		s := newTestSmart()
+		pc := newSmartPacketConn(&fakePacketConn{}, s, "A", metadata, time.Now(), 0)
+
+		if _, err := pc.WriteTo([]byte("query"), nil); err != nil {
+			t.Fatalf("write failed: %v", err)
+		}
+		if err := pc.Close(); err != nil {
+			t.Fatalf("close failed: %v", err)
+		}
+		st := s.states["A"]
+		if st == nil || st.failStreak != 1 {
+			t.Fatalf("an unanswered UDP session must fail the node, got %+v", st)
+		}
+		record := s.sites[getKey(metadata)]
+		if record == nil || record.proxies["A"] == nil || record.proxies["A"].lastFailure.IsZero() {
+			t.Fatalf("an unanswered UDP session must record a site failure")
+		}
+	})
+
+	t.Run("write then read then close", func(t *testing.T) {
+		s := newTestSmart()
+		pc := newSmartPacketConn(&fakePacketConn{readData: []byte("answer")}, s, "A", metadata, time.Now(), 0)
+
+		if _, err := pc.WriteTo([]byte("query"), nil); err != nil {
+			t.Fatalf("write failed: %v", err)
+		}
+		if _, _, err := pc.ReadFrom(make([]byte, 8)); err != nil {
+			t.Fatalf("read failed: %v", err)
+		}
+		if err := pc.Close(); err != nil {
+			t.Fatalf("close failed: %v", err)
+		}
+		st := s.states["A"]
+		if st == nil || st.failStreak != 0 {
+			t.Fatalf("an answered UDP session must not fail the node, got %+v", st)
+		}
+		if st.score <= 0 {
+			t.Fatalf("an answered UDP session must feed the latency scorer, got %v", st.score)
+		}
+		record := s.sites[getKey(metadata)]
+		if record == nil || record.proxies["A"] == nil || record.proxies["A"].lastSuccess.IsZero() {
+			t.Fatalf("an answered UDP session must record a site success")
+		}
+	})
+}
+
+func TestSmartPacketConnWaitReadFromMarksData(t *testing.T) {
+	s := newTestSmart()
+	metadata := &C.Metadata{Host: "udp-waitread.example.com"}
+	pc := newSmartPacketConn(&fakePacketConn{readData: []byte("answer")}, s, "A", metadata, time.Now(), 0)
+
+	if _, err := pc.WriteTo([]byte("query"), nil); err != nil {
+		t.Fatalf("write failed: %v", err)
+	}
+	data, _, _, err := pc.WaitReadFrom()
+	if err != nil || len(data) == 0 {
+		t.Fatalf("wait read failed: %v", err)
+	}
+	if err := pc.Close(); err != nil {
+		t.Fatalf("close failed: %v", err)
+	}
+	if st := s.states["A"]; st == nil || st.failStreak != 0 {
+		t.Fatalf("WaitReadFrom data must count as answered, got %+v", st)
+	}
+}
+
+func TestSmartPacketConnListenLatencyLeg(t *testing.T) {
+	s := newTestSmart()
+	metadata := &C.Metadata{Host: "udp-latency.example.com"}
+	// The listen leg is added back so a UDP sample stays comparable with the
+	// URL-test basis, mirroring the TCP dial leg.
+	pc := newSmartPacketConn(&fakePacketConn{readData: []byte("answer")}, s, "A", metadata,
+		time.Now().Add(-100*time.Millisecond), 100*time.Millisecond)
+
+	if _, _, err := pc.ReadFrom(make([]byte, 8)); err != nil {
+		t.Fatalf("read failed: %v", err)
+	}
+	// Read-first session: delay runs from listenDone, plus the listen leg.
+	if got := s.states["A"].score; got < 100 {
+		t.Fatalf("the listen leg must be included in the sample, got %vms", got)
 	}
 }

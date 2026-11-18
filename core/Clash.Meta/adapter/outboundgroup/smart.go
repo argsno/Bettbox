@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"net"
 	"sort"
 	"strconv"
 	"strings"
@@ -239,7 +240,7 @@ type Smart struct {
 	// member, attempts the last probe try, decidable or not.
 	service   string
 	verdicts  map[string]serviceVerdict
-	attempts  map[string]time.Time
+	attempts  map[string]serviceProbeAttempt
 	lastProbe time.Time
 	probing   bool
 }
@@ -412,6 +413,7 @@ func (s *Smart) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (
 			break
 		}
 
+		listenStart := time.Now()
 		pc, err := proxy.ListenPacketContext(ctx, metadata)
 		if err != nil {
 			lastErr = err
@@ -430,9 +432,14 @@ func (s *Smart) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (
 			continue
 		}
 
+		listenDone := time.Now()
+		listenLatency := listenDone.Sub(listenStart)
+		if listenLatency < 0 {
+			listenLatency = 0
+		}
 		s.reportUsed(proxy.Name())
 		pc.AppendToChains(s)
-		return pc, nil
+		return newSmartPacketConn(pc, s, proxy.Name(), metadata, listenDone, listenLatency), nil
 	}
 
 	if lastErr == nil {
@@ -1149,6 +1156,104 @@ func (c *smartConn) Upstream() any {
 
 var _ C.Conn = (*smartConn)(nil)
 
+// smartPacketConn wraps a member packet connection the way smartConn wraps a
+// TCP one: the first answered datagram feeds the latency scorer and the site
+// memory, and a session that wrote but never heard back counts as a node
+// failure. Retransmission counters are TCP-only and have no UDP equivalent.
+type smartPacketConn struct {
+	C.PacketConn
+
+	smart     *Smart
+	proxyName string
+	metadata  *C.Metadata
+
+	listenDone    time.Time     // listen completion, the earliest point latency can start
+	listenLatency time.Duration // time spent in proxy.ListenPacketContext
+
+	writeMutex sync.Mutex
+	firstWrite time.Time
+	wroteData  atomic.Bool
+
+	firstReadOnce sync.Once
+	gotData       atomic.Bool
+	closeOnce     sync.Once
+}
+
+func newSmartPacketConn(pc C.PacketConn, smart *Smart, proxyName string, metadata *C.Metadata, listenDone time.Time, listenLatency time.Duration) C.PacketConn {
+	return &smartPacketConn{
+		PacketConn:    pc,
+		smart:         smart,
+		proxyName:     proxyName,
+		metadata:      metadata,
+		listenDone:    listenDone,
+		listenLatency: listenLatency,
+	}
+}
+
+func (c *smartPacketConn) ReadFrom(b []byte) (int, net.Addr, error) {
+	n, addr, err := c.PacketConn.ReadFrom(b)
+	if n > 0 {
+		c.markFirstRead()
+	}
+	return n, addr, err
+}
+
+func (c *smartPacketConn) WaitReadFrom() ([]byte, func(), net.Addr, error) {
+	data, put, addr, err := c.PacketConn.WaitReadFrom()
+	if len(data) > 0 {
+		c.markFirstRead()
+	}
+	return data, put, addr, err
+}
+
+func (c *smartPacketConn) WriteTo(b []byte, addr net.Addr) (int, error) {
+	n, err := c.PacketConn.WriteTo(b, addr)
+	if n > 0 {
+		c.markWrite()
+	}
+	return n, err
+}
+
+func (c *smartPacketConn) Close() error {
+	c.closeOnce.Do(func() {
+		// A session that wrote but never heard back is evidence against the
+		// node; a listener closed without any write says nothing about it.
+		if c.wroteData.Load() && !c.gotData.Load() {
+			c.smart.reportFailure(c.proxyName, c.metadata)
+		}
+	})
+	return c.PacketConn.Close()
+}
+
+func (c *smartPacketConn) markWrite() {
+	c.writeMutex.Lock()
+	defer c.writeMutex.Unlock()
+	if c.firstWrite.IsZero() {
+		c.firstWrite = time.Now()
+	}
+	c.wroteData.Store(true)
+}
+
+func (c *smartPacketConn) markFirstRead() {
+	c.firstReadOnce.Do(func() {
+		c.gotData.Store(true)
+		c.writeMutex.Lock()
+		base := c.listenDone
+		if c.firstWrite.After(base) {
+			base = c.firstWrite
+		}
+		c.writeMutex.Unlock()
+		delayMs := float64(firstResponseDelay(base, time.Now(), c.listenLatency)) / float64(time.Millisecond)
+		c.smart.reportLatency(c.proxyName, c.metadata, delayMs)
+	})
+}
+
+func (c *smartPacketConn) Upstream() any {
+	return c.PacketConn
+}
+
+var _ C.PacketConn = (*smartPacketConn)(nil)
+
 func NewSmart(option GroupCommonOption, smartOption SmartOption, emptyFallback C.Proxy, providers []P.ProxyProvider) (*Smart, error) {
 	priority, err := parsePolicyPriority(smartOption.PolicyPriority)
 	if err != nil {
@@ -1183,6 +1288,6 @@ func NewSmart(option GroupCommonOption, smartOption SmartOption, emptyFallback C
 		priority:       priority,
 		service:        service,
 		verdicts:       make(map[string]serviceVerdict),
-		attempts:       make(map[string]time.Time),
+		attempts:       make(map[string]serviceProbeAttempt),
 	}, nil
 }
