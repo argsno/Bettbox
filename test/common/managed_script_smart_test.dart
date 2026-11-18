@@ -95,7 +95,7 @@ void main() {
     final smart = group(config, '智能选择');
     expect(smart['proxies'], ['🇭🇰 HK 01', '🇭🇰 HK 02']);
     expect(smart['interval'], isNull);
-    expect(smart['lazy'], isNull);
+    expect(smart['lazy'], isTrue);
     expect(smart['tolerance'], isNull);
     expect(smart['exclude-type'], 'DIRECT');
     expect(group(config, '默认代理')['proxies'], ['香港', '手动选择', '自动选择', '智能选择']);

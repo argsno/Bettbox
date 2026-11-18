@@ -4,7 +4,7 @@
  * 自定义分流远程规则集：@appshubcc https://github.com/appshubcc/bett-rules 
  */
 
-// @version 2026111807
+// @version 2026111811
 const Compatible_With_Bettbox = { ruleOptionsEnable: true };
 
 const ruleOptionsEnable = {
@@ -304,11 +304,13 @@ const urlTestBaseOption = {
   hidden: true,
 };
 
-// smart 组（proxies 方式）由解析器固定 600s 重测间隔，interval 无效；lazy 仍按默认值生效，
-// tolerance 被忽略，因此单独定义
+// smart 组（proxies 方式）由解析器固定 600s 重测间隔，interval 无效；tolerance 被忽略，
+// 因此单独定义。lazy 显式开启：无人使用的 smart 组不再周期重测，与 url-test 组一致，
+// 闲置时探测侧也完全静默。
 const smartBaseOption = {
   ...groupBaseOption,
   type: 'smart',
+  lazy: true,
   'exclude-type': 'DIRECT',
   icon: `${iconBaseUrl}common/Auto.svg`,
   hidden: true,

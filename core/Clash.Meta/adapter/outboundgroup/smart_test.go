@@ -106,6 +106,7 @@ func newTestSmart() *Smart {
 		states:   make(map[string]*smartPolicyState),
 		sites:    make(map[string]*smartSiteRecord),
 		verdicts: make(map[string]serviceVerdict),
+		attempts: make(map[string]time.Time),
 	}
 }
 

@@ -235,9 +235,11 @@ type Smart struct {
 	rankGen   uint64
 
 	// service is empty unless the group ranks members by their ability to
-	// reach one service; verdicts holds the last probe result per member.
+	// reach one service; verdicts holds the last decidable probe result per
+	// member, attempts the last probe try, decidable or not.
 	service   string
 	verdicts  map[string]serviceVerdict
+	attempts  map[string]time.Time
 	lastProbe time.Time
 	probing   bool
 }
@@ -609,6 +611,25 @@ func siteStatus(entries map[string]smartSiteEntry, name string, now time.Time) (
 	return hit, miss
 }
 
+// stickySitePick returns the preferred member that most recently served the
+// site. The pick is self-reinforcing: while the member keeps answering, its
+// success stays the newest, and it drops out as soon as it fails, falls out of
+// the preferred band, or the service probe demotes it.
+func stickySitePick(ranked []smartCandidate, preferred []int, entries map[string]smartSiteEntry, now time.Time) (int, bool) {
+	sticky := -1
+	var newest time.Time
+	for _, idx := range preferred {
+		name := ranked[idx].proxy.Name()
+		if hit, _ := siteStatus(entries, name, now); !hit {
+			continue
+		}
+		if success := entries[name].lastSuccess; sticky < 0 || success.After(newest) {
+			sticky, newest = idx, success
+		}
+	}
+	return sticky, sticky >= 0
+}
+
 // sameProxyList reports whether both slices share a backing array. GroupBase
 // rebuilds its proxy slice when a provider version changes, so backing-array
 // identity notices membership updates without comparing every element.
@@ -676,8 +697,9 @@ func (s *Smart) orderedCandidates(metadata *C.Metadata, touch bool) []C.Proxy {
 	if len(proxies) == 0 {
 		return nil
 	}
-	// The first connection after the throttle window is a good moment to learn
-	// which members can serve the service at all.
+	// Connections are the trigger to learn which members can serve the
+	// service; the selection skips members with a fresh verdict, so a group
+	// that already knows its members dials nothing extra.
 	s.maybeProbeService(proxies)
 
 	now := time.Now()
@@ -747,7 +769,18 @@ func (s *Smart) orderedCandidates(metadata *C.Metadata, touch bool) []C.Proxy {
 		}
 
 		if len(preferred) > 0 {
-			firstPick = preferred[rand.Intn(len(preferred))]
+			// Service groups pin the destination to the member that most recently
+			// served it: Google and OpenAI tie sessions to the egress IP, so
+			// rotating inside the preferred set costs more than the load it
+			// spreads. General groups keep the rotation.
+			if s.service != "" {
+				if sticky, ok := stickySitePick(ranked, preferred, siteEntries, now); ok {
+					firstPick = sticky
+				}
+			}
+			if firstPick < 0 {
+				firstPick = preferred[rand.Intn(len(preferred))]
+			}
 		} else {
 			// nothing preferred: still try a live policy before a dead one, even
 			// if every live policy is suspended for this site.
@@ -1150,5 +1183,6 @@ func NewSmart(option GroupCommonOption, smartOption SmartOption, emptyFallback C
 		priority:       priority,
 		service:        service,
 		verdicts:       make(map[string]serviceVerdict),
+		attempts:       make(map[string]time.Time),
 	}, nil
 }

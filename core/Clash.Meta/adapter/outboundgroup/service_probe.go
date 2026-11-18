@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -20,11 +21,26 @@ import (
 // the media unlock panel and the core ranks members by the same rules, so a
 // region edit must land on both sides.
 const (
-	serviceProbeTimeout  = 5 * time.Second
-	serviceProbeWorkers  = 8
-	serviceProbeInterval = 5 * time.Minute
-	serviceVerdictTTL    = 20 * time.Minute
-	serviceProbeMaxBody  = 256 << 10
+	serviceProbeTimeout = 5 * time.Second
+	serviceProbeWorkers = 8
+	// serviceProbeInterval throttles run starts, not member probes: runs are
+	// incremental, so re-checking the member list once a minute is cheap.
+	serviceProbeInterval = time.Minute
+	// serviceVerdictRefresh is when a known verdict is re-probed. It sits below
+	// the TTL with a margin wider than the run throttle plus a probe timeout,
+	// so a member in active use never has its verdict lapse between runs.
+	serviceVerdictRefresh = 15 * time.Minute
+	// serviceVerdictTTL is how long a verdict is trusted for ranking when no
+	// newer answer arrives (the group is idle or the probes keep failing).
+	serviceVerdictTTL = 20 * time.Minute
+	// serviceProbeRetry backs off a member whose last attempt produced no
+	// verdict, so an unreachable member is not retried on every connection.
+	serviceProbeRetry = 5 * time.Minute
+	// serviceProbeBatch caps one run; deeper members wait for later runs, so
+	// the probe budget follows the ranking instead of the roster.
+	serviceProbeBatch = 12
+
+	serviceProbeMaxBody = 256 << 10
 )
 
 type servicePreset struct {
@@ -128,6 +144,13 @@ type serviceVerdict struct {
 	known   bool
 	blocked bool
 	region  string
+}
+
+// serviceProbeOutcome is one member's result in a probe run: done is false
+// when the request itself failed, in which case only the attempt is recorded.
+type serviceProbeOutcome struct {
+	verdict serviceVerdict
+	done    bool
 }
 
 var geminiRegionPatterns = []*regexp.Regexp{
@@ -252,11 +275,11 @@ func probeServiceVerdict(ctx context.Context, proxyName, service string) (servic
 	return evaluateServiceResponse(preset, resp.StatusCode, finalURL, string(body)), nil
 }
 
-func (s *Smart) probeServiceMembers(proxies []C.Proxy, service string) map[string]serviceVerdict {
+func (s *Smart) probeServiceMembers(proxies []C.Proxy, service string) map[string]serviceProbeOutcome {
 	sem := make(chan struct{}, serviceProbeWorkers)
 	var mu sync.Mutex
 	var wg sync.WaitGroup
-	verdicts := make(map[string]serviceVerdict, len(proxies))
+	outcomes := make(map[string]serviceProbeOutcome, len(proxies))
 	for _, proxy := range proxies {
 		if proxy == nil {
 			continue
@@ -270,25 +293,76 @@ func (s *Smart) probeServiceMembers(proxies []C.Proxy, service string) map[strin
 			ctx, cancel := context.WithTimeout(context.Background(), serviceProbeTimeout)
 			defer cancel()
 			verdict, err := probeServiceVerdict(ctx, proxy.Name(), service)
-			if err != nil {
-				// A failed probe says nothing about the member's region, so the
-				// previous verdict keeps its weight until it expires.
-				return
-			}
-			log.Debugln("[Smart] service %s via %s: region=%q known=%t blocked=%t",
-				service, proxy.Name(), verdict.region, verdict.known, verdict.blocked)
 			mu.Lock()
-			verdicts[proxy.Name()] = verdict
+			if err != nil {
+				// A failed request says nothing about the member's region; it only
+				// counts as an attempt so the retry backoff can pace it.
+				outcomes[proxy.Name()] = serviceProbeOutcome{}
+				log.Debugln("[Smart] service %s via %s: probe failed: %v", service, proxy.Name(), err)
+			} else {
+				outcomes[proxy.Name()] = serviceProbeOutcome{verdict: verdict, done: true}
+				log.Debugln("[Smart] service %s via %s: region=%q known=%t blocked=%t",
+					service, proxy.Name(), verdict.region, verdict.known, verdict.blocked)
+			}
 			mu.Unlock()
 		}()
 	}
 	wg.Wait()
-	return verdicts
+	return outcomes
 }
 
-// maybeProbeService probes on the first connection after the throttle window
-// and on dial-failure health checks: probing every member costs one small
-// request each, so a run in flight or a fresh result skips it.
+// selectServiceProbeMembersLocked returns the members the next run should
+// probe: alive members without a fresh verdict, best score first, capped at
+// serviceProbeBatch. With no fresh verdict at all the cap is lifted, so a group
+// bootstrapping or waking from idle re-learns its whole roster in one run.
+// Callers must hold s.mu.
+func (s *Smart) selectServiceProbeMembersLocked(proxies []C.Proxy, now time.Time) []C.Proxy {
+	fresh := 0
+	type pendingMember struct {
+		proxy C.Proxy
+		score float64
+	}
+	pending := make([]pendingMember, 0, len(proxies))
+	for _, proxy := range proxies {
+		if proxy == nil {
+			continue
+		}
+		name := proxy.Name()
+		if verdict, ok := s.verdicts[name]; ok && verdict.known && now.Sub(verdict.at) < serviceVerdictRefresh {
+			fresh++
+			continue
+		}
+		if attempt, ok := s.attempts[name]; ok && now.Sub(attempt) < serviceProbeRetry {
+			continue
+		}
+		// A member whose URL test failed cannot be picked anyway; its verdict
+		// matters again once it answers, and this scan runs every minute.
+		if !proxy.AliveForTestUrl(s.testUrl) {
+			continue
+		}
+		pending = append(pending, pendingMember{proxy: proxy, score: s.scoreOf(proxy, s.states[name], now)})
+	}
+	if len(pending) == 0 {
+		return nil
+	}
+	if fresh > 0 {
+		sort.SliceStable(pending, func(i, j int) bool { return pending[i].score < pending[j].score })
+		if len(pending) > serviceProbeBatch {
+			pending = pending[:serviceProbeBatch]
+		}
+	}
+	members := make([]C.Proxy, 0, len(pending))
+	for _, item := range pending {
+		members = append(members, item.proxy)
+	}
+	return members
+}
+
+// maybeProbeService probes the members that currently lack a fresh verdict, on
+// the first connection after the throttle window and on dial-failure health
+// checks. Idle groups dial nothing: without traffic or failures there is no
+// trigger, and a run only spends requests on members whose verdict is missing
+// or older than serviceVerdictRefresh.
 func (s *Smart) maybeProbeService(proxies []C.Proxy) {
 	if s.service == "" || len(proxies) == 0 {
 		return
@@ -299,32 +373,60 @@ func (s *Smart) maybeProbeService(proxies []C.Proxy) {
 		s.mu.Unlock()
 		return
 	}
+	selected := s.selectServiceProbeMembersLocked(proxies, now)
+	if len(selected) == 0 {
+		s.mu.Unlock()
+		return
+	}
 	s.probing = true
 	s.lastProbe = now
 	s.mu.Unlock()
 
 	go func() {
-		verdicts := s.probeServiceMembers(proxies, s.service)
+		log.Debugln("[Smart] %s: probing %d/%d members for service %s",
+			s.Name(), len(selected), len(proxies), s.service)
+		outcomes := s.probeServiceMembers(selected, s.service)
 		s.mu.Lock()
 		s.probing = false
-		s.mergeVerdictsLocked(verdicts)
+		s.applyProbeOutcomesLocked(outcomes, proxies, time.Now())
 		s.invalidateRankCacheLocked()
 		s.mu.Unlock()
 	}()
 }
 
-// mergeVerdictsLocked keeps undecidable results out of the map so a member that
-// was already demoted is not silently promoted; the old entry expires on its TTL.
-// Callers must hold s.mu.
-func (s *Smart) mergeVerdictsLocked(verdicts map[string]serviceVerdict) {
-	for name, verdict := range verdicts {
-		if !verdict.known {
-			continue
+// applyProbeOutcomesLocked records one run's results: a known verdict replaces
+// the member's previous one, while an undecidable answer or a failed request
+// only marks the attempt, so the old verdict keeps its weight until its TTL and
+// the member is not retried immediately. Verdicts of members that left the
+// group are dropped instead of lingering forever. Callers must hold s.mu.
+func (s *Smart) applyProbeOutcomesLocked(outcomes map[string]serviceProbeOutcome, members []C.Proxy, now time.Time) {
+	current := make(map[string]struct{}, len(members))
+	for _, proxy := range members {
+		if proxy != nil {
+			current[proxy.Name()] = struct{}{}
 		}
-		if s.verdicts == nil {
-			s.verdicts = make(map[string]serviceVerdict, len(verdicts))
+	}
+	for name, outcome := range outcomes {
+		if s.attempts == nil {
+			s.attempts = make(map[string]time.Time, len(outcomes))
 		}
-		s.verdicts[name] = verdict
+		s.attempts[name] = now
+		if outcome.done && outcome.verdict.known {
+			if s.verdicts == nil {
+				s.verdicts = make(map[string]serviceVerdict, len(outcomes))
+			}
+			s.verdicts[name] = outcome.verdict
+		}
+	}
+	for name := range s.verdicts {
+		if _, ok := current[name]; !ok {
+			delete(s.verdicts, name)
+		}
+	}
+	for name := range s.attempts {
+		if _, ok := current[name]; !ok {
+			delete(s.attempts, name)
+		}
 	}
 }
 

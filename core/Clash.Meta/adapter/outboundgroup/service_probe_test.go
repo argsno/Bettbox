@@ -1,6 +1,7 @@
 package outboundgroup
 
 import (
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -186,37 +187,164 @@ func TestSmartServiceBlockedVerdict(t *testing.T) {
 	}
 }
 
-func TestSmartMergeVerdictsKeepsBlocked(t *testing.T) {
+func TestSmartApplyProbeOutcomes(t *testing.T) {
 	s := newTestSmartWithProxies(newFakeProxy("a", 100), newFakeProxy("b", 200))
 	s.service = "openai"
 	now := time.Now()
 	s.verdicts["a"] = serviceVerdict{at: now, known: true, blocked: true}
 
 	s.mu.Lock()
-	s.mergeVerdictsLocked(map[string]serviceVerdict{
-		// A 429, a 5xx or a challenge page says nothing about the member, so the
-		// demotion stays until it expires on its own TTL.
-		"a": {at: now},
-		// A decidable answer is still recorded.
-		"b": {at: now, known: true, blocked: true},
-	})
+	s.applyProbeOutcomesLocked(map[string]serviceProbeOutcome{
+		// A 429, a 5xx or a challenge page says nothing about the member, so
+		// the demotion stays until it expires on its own TTL; only the attempt
+		// is recorded to pace the retry.
+		"a": {done: true, verdict: serviceVerdict{at: now}},
+		// A failed request records the attempt without touching the verdict.
+		"b": {},
+	}, s.Proxies(), now)
 	blockedA := s.serviceBlockedLocked("a", now)
-	blockedB := s.serviceBlockedLocked("b", now)
+	attemptA := s.attempts["a"]
+	attemptB := s.attempts["b"]
 	s.mu.Unlock()
 
 	if !blockedA {
 		t.Fatal("an undecidable probe must not lift the previous blocked verdict")
 	}
-	if !blockedB {
-		t.Fatal("a known blocked verdict must be recorded")
+	if attemptA.IsZero() || attemptB.IsZero() {
+		t.Fatal("every probed member must record an attempt, verdict or not")
 	}
 
 	s.mu.Lock()
-	s.mergeVerdictsLocked(map[string]serviceVerdict{"a": {at: now, known: true}})
-	cleared := s.serviceBlockedLocked("a", now)
+	s.applyProbeOutcomesLocked(map[string]serviceProbeOutcome{
+		"a": {done: true, verdict: serviceVerdict{at: now, known: true}},
+		"b": {done: true, verdict: serviceVerdict{at: now, known: true, blocked: true}},
+	}, s.Proxies(), now)
+	clearedA := s.serviceBlockedLocked("a", now)
+	blockedB := s.serviceBlockedLocked("b", now)
 	s.mu.Unlock()
-	if cleared {
+	if clearedA {
 		t.Fatal("a known allowed verdict must lift the demotion")
+	}
+	if !blockedB {
+		t.Fatal("a known blocked verdict must be recorded")
+	}
+}
+
+func TestSmartApplyProbeOutcomesPrunesGoneMembers(t *testing.T) {
+	s := newTestSmartWithProxies(newFakeProxy("a", 100))
+	s.service = "openai"
+	now := time.Now()
+	s.verdicts["ghost"] = serviceVerdict{at: now, known: true, blocked: true}
+	s.attempts["ghost"] = now
+
+	s.mu.Lock()
+	s.applyProbeOutcomesLocked(map[string]serviceProbeOutcome{
+		"ghost": {done: true, verdict: serviceVerdict{at: now, known: true}},
+	}, s.Proxies(), now)
+	s.mu.Unlock()
+
+	if _, ok := s.verdicts["ghost"]; ok {
+		t.Fatal("a verdict for a member that left the group must be dropped")
+	}
+	if _, ok := s.attempts["ghost"]; ok {
+		t.Fatal("an attempt for a member that left the group must be dropped")
+	}
+}
+
+func TestSmartSelectServiceProbeMembers(t *testing.T) {
+	alive := newFakeProxy("Alive", 100)
+	slow := newFakeProxy("Slow", 300)
+	dead := newFakeProxy("Dead", 50)
+	dead.alive = false
+	s := newTestSmartWithProxies(alive, slow, dead)
+	s.service = "openai"
+	now := time.Now()
+
+	selectNames := func() []string {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return names(s.selectServiceProbeMembersLocked(s.Proxies(), now))
+	}
+
+	// Bootstrap: no verdict exists, so every alive member is probed at once.
+	if got, want := selectNames(), []string{"Alive", "Slow"}; !slices.Equal(got, want) {
+		t.Fatalf("bootstrap must probe every alive member, want %v got %v", want, got)
+	}
+
+	// A fresh verdict takes the member out until the refresh window lapses.
+	s.mu.Lock()
+	s.verdicts["Alive"] = serviceVerdict{at: now, known: true}
+	s.mu.Unlock()
+	if got, want := selectNames(), []string{"Slow"}; !slices.Equal(got, want) {
+		t.Fatalf("a fresh verdict must exclude the member, want %v got %v", want, got)
+	}
+
+	// A recent attempt that produced no verdict backs the member off.
+	s.mu.Lock()
+	s.attempts["Slow"] = now
+	s.mu.Unlock()
+	if got := selectNames(); len(got) != 0 {
+		t.Fatalf("a recent failed attempt must back the member off, got %v", got)
+	}
+
+	// Once both the retry and the refresh window lapse, the member returns.
+	s.mu.Lock()
+	s.attempts["Slow"] = now.Add(-serviceProbeRetry - time.Second)
+	s.verdicts["Alive"] = serviceVerdict{at: now.Add(-serviceVerdictRefresh - time.Second), known: true}
+	s.mu.Unlock()
+	if got, want := selectNames(), []string{"Alive", "Slow"}; !slices.Equal(got, want) {
+		t.Fatalf("stale verdicts must be re-probed, want %v got %v", want, got)
+	}
+}
+
+func TestSmartSelectServiceProbeMembersBatchCap(t *testing.T) {
+	var proxies []C.Proxy
+	for i := 0; i < 20; i++ {
+		proxies = append(proxies, newFakeProxy(fmt.Sprintf("P%02d", i), uint16(100+i*50)))
+	}
+	s := newTestSmartWithProxies(proxies...)
+	s.service = "youtube"
+	now := time.Now()
+	// One member is already fresh, so the run is incremental and capped.
+	s.verdicts["P00"] = serviceVerdict{at: now, known: true}
+
+	s.mu.Lock()
+	selected := s.selectServiceProbeMembersLocked(s.Proxies(), now)
+	s.mu.Unlock()
+	if len(selected) != serviceProbeBatch {
+		t.Fatalf("an incremental run must cap at %d members, got %d", serviceProbeBatch, len(selected))
+	}
+	for _, proxy := range selected {
+		if proxy.Name() == "P19" {
+			t.Fatal("the worst-scored tail must wait for a later run")
+		}
+	}
+
+	// The cap lifts only when no fresh verdict exists at all.
+	s.mu.Lock()
+	delete(s.verdicts, "P00")
+	full := s.selectServiceProbeMembersLocked(s.Proxies(), now)
+	s.mu.Unlock()
+	if len(full) != 20 {
+		t.Fatalf("a bootstrap run must sweep every alive member, got %d", len(full))
+	}
+}
+
+func TestSmartMaybeProbeServiceSkipsWhenNothingStale(t *testing.T) {
+	s := newTestSmartWithProxies(newFakeProxy("a", 100), newFakeProxy("b", 200))
+	s.service = "openai"
+	now := time.Now()
+	s.verdicts["a"] = serviceVerdict{at: now, known: true}
+	s.verdicts["b"] = serviceVerdict{at: now, known: true}
+
+	s.maybeProbeService(s.Proxies())
+
+	s.mu.Lock()
+	probing := s.probing
+	lastProbe := s.lastProbe
+	s.mu.Unlock()
+	if probing || !lastProbe.IsZero() {
+		t.Fatalf("nothing to learn must not start a run, probing=%t lastProbe=%v", probing, lastProbe)
 	}
 }
 
@@ -266,6 +394,108 @@ func TestSmartBlockedMemberBeatsDeadFirstPick(t *testing.T) {
 	order := s.orderedCandidates(&C.Metadata{Host: "chatgpt.com"}, false)
 	if got, want := names(order), []string{"a", "b", "dead"}; !slices.Equal(got, want) {
 		t.Fatalf("a live-but-blocked member must be tried before a dead one: want %v, got %v", want, got)
+	}
+}
+
+func TestSmartServiceGroupSticksToRecentSiteMember(t *testing.T) {
+	best := newFakeProxy("Best", 100)
+	recent := newFakeProxy("Recent", 130) // inside the widened hit band
+	s := newTestSmartWithProxies(best, recent)
+	s.service = "openai"
+	metadata := &C.Metadata{Host: "sticky.example.com"}
+	now := time.Now()
+	s.rememberSite(metadata, "Recent", true, now.Add(-time.Minute))
+	s.lastProbe = now // the ordering itself must not start a probe run
+
+	for i := 0; i < 32; i++ {
+		order := s.orderedCandidates(metadata, false)
+		if len(order) != 2 || order[0].Name() != "Recent" {
+			t.Fatalf("the recent site member must stay the first pick, got %v on call %d", names(order), i)
+		}
+	}
+}
+
+func TestSmartStickyPickTakesMostRecentSuccess(t *testing.T) {
+	a := newFakeProxy("A", 100)
+	b := newFakeProxy("B", 110)
+	s := newTestSmartWithProxies(a, b)
+	s.service = "youtube"
+	metadata := &C.Metadata{Host: "recent-wins.example.com"}
+	now := time.Now()
+	s.rememberSite(metadata, "A", true, now.Add(-2*time.Minute))
+	s.rememberSite(metadata, "B", true, now.Add(-time.Minute))
+	s.lastProbe = now
+
+	for i := 0; i < 16; i++ {
+		if order := s.orderedCandidates(metadata, false); order[0].Name() != "B" {
+			t.Fatalf("the most recent success must win, got %v", names(order))
+		}
+	}
+}
+
+func TestSmartStickyMemberOutOfBandIsNotPinned(t *testing.T) {
+	best := newFakeProxy("Best", 100)
+	degraded := newFakeProxy("Degraded", 300) // 3x the best: outside even the hit band
+	s := newTestSmartWithProxies(best, degraded)
+	s.service = "openai"
+	metadata := &C.Metadata{Host: "out-of-band.example.com"}
+	now := time.Now()
+	s.rememberSite(metadata, "Degraded", true, now.Add(-time.Minute))
+	s.lastProbe = now
+
+	for i := 0; i < 8; i++ {
+		if order := s.orderedCandidates(metadata, false); order[0].Name() != "Best" {
+			t.Fatalf("an out-of-band member must not be pinned, got %v", names(order))
+		}
+	}
+}
+
+func TestSmartStickyMemberSkipsServiceBlockedAndSiteMiss(t *testing.T) {
+	metadata := &C.Metadata{Host: "sticky-edge.example.com"}
+	now := time.Now()
+
+	t.Run("service-blocked verdict", func(t *testing.T) {
+		blocked := newFakeProxy("Blocked", 100)
+		other := newFakeProxy("Other", 110)
+		s := newTestSmartWithProxies(blocked, other)
+		s.service = "openai"
+		s.verdicts["Blocked"] = serviceVerdict{at: now, known: true, blocked: true}
+		s.rememberSite(metadata, "Blocked", true, now.Add(-time.Minute))
+		s.lastProbe = now
+
+		if order := s.orderedCandidates(metadata, false); order[0].Name() == "Blocked" {
+			t.Fatalf("a service-blocked member must not be pinned, got %v", names(order))
+		}
+	})
+
+	t.Run("fresh site failure", func(t *testing.T) {
+		failing := newFakeProxy("Failing", 100)
+		other := newFakeProxy("Other", 110)
+		s := newTestSmartWithProxies(failing, other)
+		s.service = "openai"
+		s.rememberSite(metadata, "Failing", true, now.Add(-2*time.Minute))
+		s.rememberSite(metadata, "Failing", false, now.Add(-time.Minute))
+		s.lastProbe = now
+
+		if order := s.orderedCandidates(metadata, false); order[0].Name() == "Failing" {
+			t.Fatalf("a member that just failed the site must not be pinned, got %v", names(order))
+		}
+	})
+}
+
+func TestSmartGeneralGroupKeepsRotation(t *testing.T) {
+	a := newFakeProxy("A", 100)
+	b := newFakeProxy("B", 110)
+	s := newTestSmartWithProxies(a, b) // service stays empty: rotation is the point
+	metadata := &C.Metadata{Host: "rotate.example.com"}
+	s.rememberSite(metadata, "B", true, time.Now())
+
+	seen := make(map[string]bool, 2)
+	for i := 0; i < 200; i++ {
+		seen[s.orderedCandidates(metadata, false)[0].Name()] = true
+	}
+	if !seen["A"] || !seen["B"] {
+		t.Fatalf("a general group must keep rotating inside the band, saw %v", seen)
 	}
 }
 
