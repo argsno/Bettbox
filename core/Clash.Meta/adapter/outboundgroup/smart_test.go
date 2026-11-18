@@ -8,6 +8,7 @@ import (
 	"math"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -102,8 +103,9 @@ var _ C.PacketConn = (*fakePacketConn)(nil)
 
 func newTestSmart() *Smart {
 	return &Smart{
-		states: make(map[string]*smartPolicyState),
-		sites:  make(map[string]*smartSiteRecord),
+		states:   make(map[string]*smartPolicyState),
+		sites:    make(map[string]*smartSiteRecord),
+		verdicts: make(map[string]serviceVerdict),
 	}
 }
 
@@ -965,6 +967,149 @@ func TestSmartPreferredGapFloorIsFiveMilliseconds(t *testing.T) {
 	}
 	if !seen["Best"] || !seen["Near"] {
 		t.Fatalf("every policy inside the gap must be eligible, saw %v", seen)
+	}
+}
+
+// countingProxy counts the state reads the ranking path performs so a cache hit
+// can be distinguished from a rebuild.
+type countingProxy struct {
+	*fakeProxy
+	delayReads atomic.Int64
+	aliveReads atomic.Int64
+}
+
+func newCountingProxy(name string, delay uint16) *countingProxy {
+	return &countingProxy{fakeProxy: newFakeProxy(name, delay)}
+}
+
+func (p *countingProxy) LastDelayForTestUrl(url string) uint16 {
+	p.delayReads.Add(1)
+	return p.fakeProxy.LastDelayForTestUrl(url)
+}
+
+func (p *countingProxy) AliveForTestUrl(url string) bool {
+	p.aliveReads.Add(1)
+	return p.fakeProxy.AliveForTestUrl(url)
+}
+
+func TestSmartRankingCacheSharesStateReads(t *testing.T) {
+	fast := newCountingProxy("Fast", 100)
+	slow := newCountingProxy("Slow", 400)
+	s := newTestSmartWithProxies(fast, slow)
+	metadata := &C.Metadata{Host: "cache.example.com"}
+
+	s.orderedCandidates(metadata, false)
+	delayReads := fast.delayReads.Load() + slow.delayReads.Load()
+	aliveReads := fast.aliveReads.Load() + slow.aliveReads.Load()
+	if delayReads == 0 || aliveReads == 0 {
+		t.Fatalf("the first call must build the ranking, got %d delay and %d alive reads", delayReads, aliveReads)
+	}
+
+	for i := 0; i < 8; i++ {
+		s.orderedCandidates(metadata, false)
+	}
+	if got := fast.delayReads.Load() + slow.delayReads.Load(); got != delayReads {
+		t.Fatalf("a cached ranking must not re-read delays: %d -> %d", delayReads, got)
+	}
+	if got := fast.aliveReads.Load() + slow.aliveReads.Load(); got != aliveReads {
+		t.Fatalf("a cached ranking must not re-read alive state: %d -> %d", aliveReads, got)
+	}
+
+	s.reportFailure("Fast", metadata)
+	s.orderedCandidates(metadata, false)
+	if got := fast.delayReads.Load() + slow.delayReads.Load(); got == delayReads {
+		t.Fatalf("a failure must invalidate the cached ranking")
+	}
+}
+
+func TestSmartRankingCacheKeepsSiteMemoryFresh(t *testing.T) {
+	fast := newFakeProxy("Fast", 100)
+	slow := newFakeProxy("Slow", 400)
+	s := newTestSmartWithProxies(fast, slow)
+	metadata := &C.Metadata{Host: "stale-cache.example.com"}
+
+	// Prime the ranking, then record a failure without invalidating it.
+	s.orderedCandidates(metadata, false)
+	s.rememberSite(metadata, "Fast", false, time.Now())
+
+	order := s.orderedCandidates(metadata, false)
+	if len(order) != 2 || order[0].Name() != "Slow" {
+		t.Fatalf("site memory must still apply to a cached ranking, got %v", order)
+	}
+}
+
+// versionedProvider lets a test change the member list the way a subscription
+// update does: bump the version, then serve the new proxies.
+type versionedProvider struct {
+	fakeProvider
+	version uint32
+}
+
+func (f *versionedProvider) Version() uint32 { return f.version }
+
+func TestSmartRankingCacheFollowsMembership(t *testing.T) {
+	first := newCountingProxy("First", 100)
+	second := newCountingProxy("Second", 200)
+	provider := &versionedProvider{
+		fakeProvider: fakeProvider{proxies: []C.Proxy{first}},
+		version:      1,
+	}
+	s := newTestSmart()
+	s.GroupBase = NewGroupBase(GroupBaseOption{
+		Name:        "smart",
+		Type:        C.Smart,
+		TestTimeout: 1000,
+		Providers:   []P.ProxyProvider{provider},
+	})
+	s.testUrl = C.DefaultTestURL
+	metadata := &C.Metadata{Host: "members.example.com"}
+
+	if order := s.orderedCandidates(metadata, false); len(order) != 1 {
+		t.Fatalf("expected the initial member, got %v", order)
+	}
+
+	provider.proxies = []C.Proxy{first, second}
+	provider.version = 2
+
+	order := s.orderedCandidates(metadata, false)
+	if len(order) != 2 {
+		t.Fatalf("a membership change must rebuild the ranking, got %v", order)
+	}
+	if second.aliveReads.Load() == 0 || second.delayReads.Load() == 0 {
+		t.Fatalf("the new member must be scored")
+	}
+}
+
+func TestSmartHealthCheckInvalidatesRanking(t *testing.T) {
+	fast := newCountingProxy("Fast", 100)
+	slow := newCountingProxy("Slow", 400)
+	s := newTestSmartWithProxies(fast, slow)
+	metadata := &C.Metadata{Host: "health.example.com"}
+
+	s.orderedCandidates(metadata, false)
+	delayReads := fast.delayReads.Load() + slow.delayReads.Load()
+	s.mu.Lock()
+	genBefore := s.rankGen
+	s.mu.Unlock()
+
+	s.healthCheck()
+	// The health check reads alive state itself, so compare from after it ran.
+	aliveReads := fast.aliveReads.Load() + slow.aliveReads.Load()
+	s.mu.Lock()
+	genAfter := s.rankGen
+	s.mu.Unlock()
+	s.orderedCandidates(metadata, false)
+
+	// A rebuild alone would also be explained by the TTL on a slow machine, so the
+	// generation counter is the wall-clock independent proof.
+	if genAfter <= genBefore {
+		t.Fatalf("a health check must invalidate the ranking: rankGen %d -> %d", genBefore, genAfter)
+	}
+	if got := fast.delayReads.Load() + slow.delayReads.Load(); got <= delayReads {
+		t.Fatalf("a health check must invalidate the cached ranking: %d -> %d", delayReads, got)
+	}
+	if got := fast.aliveReads.Load() + slow.aliveReads.Load(); got <= aliveReads {
+		t.Fatalf("a health check must invalidate the cached ranking: %d -> %d", aliveReads, got)
 	}
 }
 

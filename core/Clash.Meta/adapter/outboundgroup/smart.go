@@ -46,10 +46,12 @@ const (
 	smartSiteFailureTTL     = 10 * time.Minute
 	smartSiteMemoryMaxSites = 512
 	smartDialRetryLimit     = 3
+	smartRankCacheTTL       = time.Second
 )
 
 type SmartOption struct {
 	PolicyPriority string `group:"policy-priority,omitempty"`
+	Service        string `group:"service,omitempty"`
 }
 
 type smartPriorityRule struct {
@@ -208,17 +210,36 @@ type smartSiteRecord struct {
 	proxies map[string]*smartSiteEntry
 }
 
+// smartRankCache is a short-lived, read-only score ranking shared by the
+// connections of one group. Site memory is not part of it: that is
+// per-destination and applied by the caller from the current site record.
+type smartRankCache struct {
+	proxies []C.Proxy
+	builtAt time.Time
+	gen     uint64
+	ranked  []smartCandidate
+}
+
 type Smart struct {
 	*GroupBase
 	disableUDP     bool
 	testUrl        string
 	expectedStatus string
 
-	mu       sync.Mutex
-	selected string
-	states   map[string]*smartPolicyState
-	sites    map[string]*smartSiteRecord
-	priority []smartPriorityRule
+	mu        sync.Mutex
+	selected  string
+	states    map[string]*smartPolicyState
+	sites     map[string]*smartSiteRecord
+	priority  []smartPriorityRule
+	rankCache *smartRankCache
+	rankGen   uint64
+
+	// service is empty unless the group ranks members by their ability to
+	// reach one service; verdicts holds the last probe result per member.
+	service   string
+	verdicts  map[string]serviceVerdict
+	lastProbe time.Time
+	probing   bool
 }
 
 // Now implements ProxyGroup: the pinned policy, else the most-used policy in
@@ -242,6 +263,8 @@ func (s *Smart) Now() string {
 	bestUsage := 0.0
 	bestScoreName := ""
 	bestScore := math.MaxFloat64
+	blockedScoreName := ""
+	blockedScore := math.MaxFloat64
 	for _, proxy := range proxies {
 		name := proxy.Name()
 		st := s.states[name]
@@ -251,15 +274,29 @@ func (s *Smart) Now() string {
 				bestName = name
 			}
 		}
-		if score := s.scoreOf(proxy, st, now); score < bestScore {
+		score := s.scoreOf(proxy, st, now)
+		if s.serviceBlockedLocked(name, now) {
+			if score < blockedScore {
+				blockedScore = score
+				blockedScoreName = name
+			}
+			continue
+		}
+		if score < bestScore {
 			bestScore = score
 			bestScoreName = name
 		}
 	}
-	if bestName != "" {
+	// A policy that still carries recent traffic can have failed its service
+	// probe since; report the best usable one so the panel never advertises a
+	// member the group will not pick first.
+	if bestName != "" && (bestScoreName == "" || !s.serviceBlockedLocked(bestName, now)) {
 		return bestName
 	}
-	return bestScoreName
+	if bestScoreName != "" {
+		return bestScoreName
+	}
+	return blockedScoreName
 }
 
 // smartNodeFailure reports whether a first-write error is evidence against the
@@ -441,39 +478,32 @@ func (s *Smart) Unwrap(metadata *C.Metadata, touch bool) C.Proxy {
 // queries and Unwrap use it so the answer never depends on a random pick.
 func (s *Smart) representativeProxy(metadata *C.Metadata, touch bool) C.Proxy {
 	proxies := s.GetProxies(touch)
+	if len(proxies) == 0 {
+		return nil
+	}
 
-	now := time.Now()
+	ranked := s.rankedCandidates(proxies, time.Now())
+	if len(ranked) == 0 {
+		return nil
+	}
+
 	s.mu.Lock()
 	pinned := s.selected
-	var pinnedProxy, bestAlive, bestAny C.Proxy
-	bestAliveScore, bestAnyScore := math.MaxFloat64, math.MaxFloat64
-	for _, proxy := range proxies {
-		if proxy == nil {
-			continue
-		}
-		name := proxy.Name()
-		if pinned != "" && name == pinned {
-			pinnedProxy = proxy
-		}
-		score := s.scoreOf(proxy, s.states[name], now)
-		if score < bestAnyScore {
-			bestAnyScore = score
-			bestAny = proxy
-		}
-		if proxy.AliveForTestUrl(s.testUrl) && score < bestAliveScore {
-			bestAliveScore = score
-			bestAlive = proxy
-		}
-	}
 	s.mu.Unlock()
 
-	if pinnedProxy != nil {
-		return pinnedProxy
+	if pinned != "" {
+		for _, item := range ranked {
+			if item.proxy.Name() == pinned {
+				return item.proxy
+			}
+		}
 	}
-	if bestAlive != nil {
-		return bestAlive
+	for _, item := range ranked {
+		if item.alive && !item.blocked {
+			return item.proxy
+		}
 	}
-	return bestAny
+	return ranked[0].proxy
 }
 
 // MarshalJSON implements C.ProxyAdapter
@@ -534,7 +564,8 @@ func (s *Smart) healthCheck() {
 	// AliveForTestUrl consults each proxy's own state; snapshot it before taking
 	// s.mu so this lock is never held while calling into a proxy.
 	alive := make(map[string]bool)
-	for _, proxy := range s.GetProxies(false) {
+	proxies := s.GetProxies(false)
+	for _, proxy := range proxies {
 		if proxy == nil {
 			continue
 		}
@@ -546,53 +577,73 @@ func (s *Smart) healthCheck() {
 			st.failStreak = 0
 		}
 	}
+	s.invalidateRankCacheLocked()
 	s.mu.Unlock()
+
+	s.maybeProbeService(proxies)
 }
 
 type smartCandidate struct {
-	proxy    C.Proxy
-	score    float64
-	alive    bool
-	siteHit  bool
-	siteMiss bool
+	proxy   C.Proxy
+	score   float64
+	alive   bool
+	blocked bool // last service probe says this member cannot serve the service
 }
 
-// orderedCandidates returns the policies to try for one request: the preferred
-// pick first (a random member of the policies closest to the best score, or
-// the pinned one), then the remaining healthy policies by score, then the
-// failed ones, so a dead connection can fall back to the next candidate.
-func (s *Smart) orderedCandidates(metadata *C.Metadata, touch bool) []C.Proxy {
-	proxies := s.GetProxies(touch)
-	if len(proxies) == 0 {
-		return nil
+// siteStatus classifies a policy for one destination using a snapshot of the
+// group's site memory. A hit widens the preferred gap, a miss keeps the policy
+// out of the first pick. Both are derived from the live record, so site memory
+// does not need to be part of the cached ranking.
+func siteStatus(entries map[string]smartSiteEntry, name string, now time.Time) (hit, miss bool) {
+	if entries == nil {
+		return false, false
 	}
+	entry, ok := entries[name]
+	if !ok {
+		return false, false
+	}
+	successFresh := !entry.lastSuccess.IsZero() && now.Sub(entry.lastSuccess) < smartSiteMemoryTTL
+	failureFresh := !entry.lastFailure.IsZero() && now.Sub(entry.lastFailure) < smartSiteFailureTTL
+	hit = successFresh && (!failureFresh || entry.lastSuccess.After(entry.lastFailure))
+	miss = failureFresh && !hit
+	return hit, miss
+}
 
-	now := time.Now()
-	siteKey := getKey(metadata)
+// sameProxyList reports whether both slices share a backing array. GroupBase
+// rebuilds its proxy slice when a provider version changes, so backing-array
+// identity notices membership updates without comparing every element.
+func sameProxyList(a, b []C.Proxy) bool {
+	return len(a) == len(b) && (len(a) == 0 || &a[0] == &b[0])
+}
 
-	candidates := make([]smartCandidate, 0, len(proxies))
+// rankedCandidates returns the group's members ordered by score. The result is
+// cached for smartRankCacheTTL and shared between connections; callers must
+// treat it as read-only. Rebuilding the ranking per connection would repeat the
+// same score reads and sort for every socket in a page load, while the
+// underlying samples decay over minutes, not milliseconds.
+func (s *Smart) rankedCandidates(proxies []C.Proxy, now time.Time) []smartCandidate {
 	s.mu.Lock()
-	var siteRecord *smartSiteRecord
-	if siteKey != "" {
-		siteRecord = s.sites[siteKey]
+	if cache := s.rankCache; cache != nil &&
+		cache.gen == s.rankGen &&
+		now.Sub(cache.builtAt) < smartRankCacheTTL &&
+		sameProxyList(cache.proxies, proxies) {
+		ranked := cache.ranked
+		s.mu.Unlock()
+		return ranked
 	}
-	pinned := s.selected
+	gen := s.rankGen
+	candidates := make([]smartCandidate, 0, len(proxies))
 	for _, proxy := range proxies {
+		if proxy == nil {
+			continue
+		}
 		st := s.states[proxy.Name()]
-		item := smartCandidate{
-			proxy: proxy,
-			score: s.scoreOf(proxy, st, now),
-			alive: proxy.AliveForTestUrl(s.testUrl),
-		}
-		if siteRecord != nil {
-			if entry, ok := siteRecord.proxies[proxy.Name()]; ok {
-				successFresh := !entry.lastSuccess.IsZero() && now.Sub(entry.lastSuccess) < smartSiteMemoryTTL
-				failureFresh := !entry.lastFailure.IsZero() && now.Sub(entry.lastFailure) < smartSiteFailureTTL
-				item.siteHit = successFresh && (!failureFresh || entry.lastSuccess.After(entry.lastFailure))
-				item.siteMiss = failureFresh && !item.siteHit
-			}
-		}
-		candidates = append(candidates, item)
+		candidates = append(candidates, smartCandidate{
+			proxy:   proxy,
+			score:   s.scoreOf(proxy, st, now),
+			alive:   proxy.AliveForTestUrl(s.testUrl),
+			blocked: s.serviceBlockedLocked(proxy.Name(), now),
+		})
 	}
 	s.mu.Unlock()
 
@@ -600,12 +651,58 @@ func (s *Smart) orderedCandidates(metadata *C.Metadata, touch bool) []C.Proxy {
 		return candidates[i].score < candidates[j].score
 	})
 
-	order := make([]C.Proxy, 0, len(candidates))
-	skip := make(map[int]struct{}, 2)
-	firstPick := -1
+	s.mu.Lock()
+	// A failure or health check invalidated the ranking while it was being
+	// built; do not resurrect the stale order.
+	if s.rankGen == gen {
+		s.rankCache = &smartRankCache{
+			proxies: proxies,
+			builtAt: now,
+			gen:     gen,
+			ranked:  candidates,
+		}
+	}
+	s.mu.Unlock()
+	return candidates
+}
 
+// orderedCandidates returns the policies to try for one request: the preferred
+// pick first (a random member of the policies closest to the best score, or
+// the pinned one), then the remaining healthy policies by score, then the ones
+// a service probe demoted, then the failed ones, so a dead connection can fall
+// back to the next candidate.
+func (s *Smart) orderedCandidates(metadata *C.Metadata, touch bool) []C.Proxy {
+	proxies := s.GetProxies(touch)
+	if len(proxies) == 0 {
+		return nil
+	}
+	// The first connection after the throttle window is a good moment to learn
+	// which members can serve the service at all.
+	s.maybeProbeService(proxies)
+
+	now := time.Now()
+	ranked := s.rankedCandidates(proxies, now)
+	if len(ranked) == 0 {
+		return nil
+	}
+	siteKey := getKey(metadata)
+
+	s.mu.Lock()
+	var siteEntries map[string]smartSiteEntry
+	if siteKey != "" {
+		if record := s.sites[siteKey]; record != nil {
+			siteEntries = make(map[string]smartSiteEntry, len(record.proxies))
+			for name, entry := range record.proxies {
+				siteEntries[name] = *entry
+			}
+		}
+	}
+	pinned := s.selected
+	s.mu.Unlock()
+
+	firstPick := -1
 	if pinned != "" {
-		for i, item := range candidates {
+		for i, item := range ranked {
 			if item.proxy.Name() == pinned {
 				firstPick = i
 				break
@@ -616,8 +713,11 @@ func (s *Smart) orderedCandidates(metadata *C.Metadata, touch bool) []C.Proxy {
 	if firstPick < 0 {
 		best := 0.0
 		hasBest := false
-		for _, item := range candidates {
-			if !item.alive || item.siteMiss {
+		for _, item := range ranked {
+			if !item.alive || item.blocked {
+				continue
+			}
+			if _, miss := siteStatus(siteEntries, item.proxy.Name(), now); miss {
 				continue
 			}
 			best = item.score
@@ -628,12 +728,16 @@ func (s *Smart) orderedCandidates(metadata *C.Metadata, touch bool) []C.Proxy {
 		var preferred []int
 		if hasBest {
 			baseGap := math.Max(best*smartPreferredGapRatio, smartPreferredGapMin)
-			for i, item := range candidates {
-				if !item.alive || item.siteMiss {
+			for i, item := range ranked {
+				if !item.alive || item.blocked {
+					continue
+				}
+				hit, miss := siteStatus(siteEntries, item.proxy.Name(), now)
+				if miss {
 					continue
 				}
 				gap := baseGap
-				if item.siteHit {
+				if hit {
 					gap = math.Max(best*smartSitePreferredGap, smartPreferredGapMin)
 				}
 				if item.score <= best+gap {
@@ -648,38 +752,55 @@ func (s *Smart) orderedCandidates(metadata *C.Metadata, touch bool) []C.Proxy {
 			// nothing preferred: still try a live policy before a dead one, even
 			// if every live policy is suspended for this site.
 			firstPick = 0
-			for i, item := range candidates {
-				if item.alive {
+			healthy := false
+			for i, item := range ranked {
+				if item.alive && !item.blocked {
 					firstPick = i
+					healthy = true
 					break
+				}
+			}
+			if !healthy {
+				// Every live member is service-blocked; a blocked member is still a
+				// better first pick than a member whose URL test failed.
+				for i, item := range ranked {
+					if item.alive {
+						firstPick = i
+						break
+					}
 				}
 			}
 		}
 	}
 
+	order := make([]C.Proxy, 0, len(ranked))
 	if firstPick >= 0 {
-		first := candidates[firstPick]
+		first := ranked[firstPick]
+		hit, miss := siteStatus(siteEntries, first.proxy.Name(), now)
 		order = append(order, first.proxy)
-		skip[firstPick] = struct{}{}
 		log.Debugln("[Smart] %s picked %s (score %.1fms, siteHit=%t, siteMiss=%t, site=%q)",
-			s.Name(), first.proxy.Name(), first.score, first.siteHit, first.siteMiss, siteKey)
+			s.Name(), first.proxy.Name(), first.score, hit, miss, siteKey)
 	}
 
-	for i, item := range candidates {
-		if _, ok := skip[i]; ok {
+	for i, item := range ranked {
+		if i == firstPick || !item.alive || item.blocked {
 			continue
 		}
-		if item.alive {
-			order = append(order, item.proxy)
-		}
+		order = append(order, item.proxy)
 	}
-	for i, item := range candidates {
-		if _, ok := skip[i]; ok {
+	// A member that cannot serve the service is still a better fallback than a
+	// member whose last URL test failed.
+	for i, item := range ranked {
+		if i == firstPick || !item.alive || !item.blocked {
 			continue
 		}
-		if !item.alive {
-			order = append(order, item.proxy)
+		order = append(order, item.proxy)
+	}
+	for i, item := range ranked {
+		if i == firstPick || item.alive {
+			continue
 		}
+		order = append(order, item.proxy)
 	}
 	return order
 }
@@ -737,7 +858,16 @@ func (s *Smart) reportFailure(name string, metadata *C.Metadata) {
 	s.mu.Lock()
 	s.stateOf(name).observeFailure(now)
 	s.rememberSite(metadata, name, false, now)
+	s.invalidateRankCacheLocked()
 	s.mu.Unlock()
+}
+
+// invalidateRankCacheLocked forces the next connection to rebuild the ranking;
+// the caller must hold s.mu. Slow-moving samples (latency, loss) are left to the
+// TTL, so a burst of connections can still share one ranking.
+func (s *Smart) invalidateRankCacheLocked() {
+	s.rankGen++
+	s.rankCache = nil
 }
 
 func (s *Smart) reportRetransmit(name string, delta sockstat.TCPStats, baseOK bool) {
@@ -991,6 +1121,13 @@ func NewSmart(option GroupCommonOption, smartOption SmartOption, emptyFallback C
 	if err != nil {
 		return nil, err
 	}
+	service, err := normalizeServiceName(smartOption.Service)
+	if err != nil {
+		// A published script can reach an older core before the next release; a
+		// typo must degrade to plain scoring instead of breaking the config.
+		log.Warnln("[Smart] %s: %v, service ranking disabled", option.Name, err)
+		service = ""
+	}
 	return &Smart{
 		GroupBase: NewGroupBase(GroupBaseOption{
 			Name:           option.Name,
@@ -1011,5 +1148,7 @@ func NewSmart(option GroupCommonOption, smartOption SmartOption, emptyFallback C
 		states:         make(map[string]*smartPolicyState),
 		sites:          make(map[string]*smartSiteRecord),
 		priority:       priority,
+		service:        service,
+		verdicts:       make(map[string]serviceVerdict),
 	}, nil
 }

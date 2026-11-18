@@ -1818,13 +1818,16 @@ proxy-groups:
       - vmess1
     url: "https://cp.cloudflare.com/generate_204"
     # policy-priority: "Premium:0.9;Backup:1.3" # 正则:系数，系数<1 提升优先级，>1 降低优先级，第一个匹配的规则生效
+    # service: "openai" # 按服务连通性排序成员，可选 openai / gemini；探测失败或无法判定时保留原排序
     # 注意：
-    # - 使用 proxies 的 smart 组检测间隔固定为 300 秒，interval 参数无效；使用 use 的 smart 组沿用 provider 的健康检查设置。
-    # - lazy 默认 true（与 url-test 一致），空闲超过 interval 时会跳过检测；不会无条件每 300 秒探测一次。
+    # - 使用 proxies 的 smart 组检测间隔固定为 600 秒，interval 参数无效；使用 use 的 smart 组沿用 provider 的健康检查设置。
+    # - lazy 默认 true（与 url-test 一致），空闲超过 interval 时会跳过检测；不会无条件每 600 秒探测一次。
     # - tolerance 被忽略。
     # - 延迟样本按 10 分钟半衰期向测速延迟回落；失败冷却按 1/2/4/8 分钟增长，站点失败记忆 10 分钟，成功记忆 1 小时。
     # - UDP 转发只在支持 UDP 的成员中选择，失败时继续尝试下一个成员。
-    # - 面板中的 Now 显示最近使用最多的策略，而不是下一次连接实际使用的策略。
+    # - 面板中的 Now 显示最近使用最多的策略，而不是下一次连接实际使用的策略；设置了 service 时，最近使用最多的成员若被探测判为不可用，会跳过它选择评分最好的可用成员。
+    # - service 探测不跟随 provider 的周期健康检查：只在连接时和拨号失败触发的健康检查时进行，5 分钟内最多一次，空闲组从不探测；结果 20 分钟内有效。
+    #   gemini 页面探测在 4xx 页面（如反爬）判为不可用，openai 的 trace 探测无法判定 4xx/5xx 或没有 ip 的页面、保留上次排序；判为不可用的成员排到健康成员之后、测速失败成员之前，429/5xx 同样保留上次排序。
 
   # select 用户自行选择节点
   - name: Proxy

@@ -4,7 +4,7 @@
  * 自定义分流远程规则集：@appshubcc https://github.com/appshubcc/bett-rules 
  */
 
-// @version 2026111501
+// @version 2026111806
 const Compatible_With_Bettbox = { ruleOptionsEnable: true };
 
 const ruleOptionsEnable = {
@@ -304,7 +304,7 @@ const urlTestBaseOption = {
   hidden: true,
 };
 
-// smart 组（proxies 方式）由解析器固定 300s 重测间隔，interval 无效；lazy 仍按默认值生效，
+// smart 组（proxies 方式）由解析器固定 600s 重测间隔，interval 无效；lazy 仍按默认值生效，
 // tolerance 被忽略，因此单独定义
 const smartBaseOption = {
   ...groupBaseOption,
@@ -959,6 +959,25 @@ function buildRegionGroups(filteredProxies) {
 /**
  * 构建用户自定义分流策略组与规则集
  */
+/**
+ * 与内核 smart 组的 `service` 选项对齐；命中这些规则集的分流项才能按服务连通性选路。
+ * 内核侧的探测策略在 core/Clash.Meta/adapter/outboundgroup/service_probe.go。
+ */
+const serviceConnectivityTags = {
+  openai: 'openai',
+  'google-gemini': 'google-gemini',
+};
+
+function serviceKeyOfSets(sets) {
+  if (!Array.isArray(sets)) return null;
+  for (const set of sets) {
+    if (!set || typeof set.tag !== 'string') continue;
+    const key = serviceConnectivityTags[set.tag];
+    if (key) return key;
+  }
+  return null;
+}
+
 function buildCustomServices(reservedNames) {
   const knownProviders = { ...baseRuleProviders };
   for (const svc of serviceConfigs) Object.assign(knownProviders, svc.providers || {});
@@ -1000,12 +1019,19 @@ function buildCustomServices(reservedNames) {
 
     reservedNames.add(route.name);
     const reject = route.target === 'REJECT';
+    const service = reject ? null : serviceKeyOfSets(route.sets);
+    // 派生名只在未被占用时生效：已有分流项可能就叫 `X-智能选择`，重名会让整份
+    // 配置无法加载。smartName 是唯一判定点，构建策略组时不再重新拼接。
+    const derivedSmartName = service && ruleOptionsEnable['智能选择'] ? `${route.name}-智能选择` : null;
+    const smartName = derivedSmartName && !reservedNames.has(derivedSmartName) ? derivedSmartName : null;
+    if (smartName) reservedNames.add(smartName);
     services.push({
       name: route.name,
       baseOption: selectBaseOption,
       custom: true,
       direct: true,
       reject,
+      ...(smartName && { service, smartName }),
       ...(!reject && typeof route.target === 'string' && { defaultSelected: route.target }),
       ...(typeof route.icon === 'string' && route.icon && { icon: route.icon }),
       providers,
@@ -1027,7 +1053,10 @@ function sortByGroupOrder(services) {
   let last = -1;
   return services
     .map((svc, index) => {
-      const order = rank.get(svc.name) ?? rank.get(svc.name.replace(/-(?:自动选择|智能选择)$/, ''));
+      // 分流项派生的 smart 子组必须排在父组之前，否则内核解析父组时找不到它；
+      // 用户保存的顺序里可能正好有同名项，因此按父组名取顺序而不是按自身名。
+      const orderName = svc.service ? svc.name.replace(/-智能选择$/, '') : svc.name;
+      const order = rank.get(orderName) ?? rank.get(orderName.replace(/-(?:自动选择|智能选择)$/, ''));
       if (order !== undefined) last = order;
       return { svc, index, key: order !== undefined ? order : last + 0.5 };
     })
@@ -1179,10 +1208,26 @@ function buildFunctionalGroups(filteredProxies, generatedRegionGroups) {
         ];
     }
 
+    // 命中已知服务的分流项在开启「智能选择」后附带一个 smart 子组，由内核按服务
+    // 连通性把不可用地区的节点排到后面，避免香港这类节点抢到 ChatGPT 流量。
+    const serviceSmartName =
+      svc.smartName && !svc.includeAll && !svc.reject && ruleOptionsEnable['智能选择'] && allProxiesNames.length
+        ? svc.smartName
+        : null;
+    if (serviceSmartName) {
+      functionalGroups.push({
+        ...smartBaseOption,
+        name: serviceSmartName,
+        service: svc.service,
+        proxies: [...allProxiesNames],
+      });
+      groupProxies = [serviceSmartName, ...groupProxies];
+    }
+
     const selected =
       svc.defaultSelected !== undefined && (!svc.custom || groupProxies.includes(svc.defaultSelected))
         ? svc.defaultSelected
-        : undefined;
+        : (serviceSmartName ?? undefined);
     if (!svc.reject) {
       for (const rule of svc.rules || []) dnsPolicyGroups.push([rule.split(',')[1], svc.name, selected === '直连']);
     }

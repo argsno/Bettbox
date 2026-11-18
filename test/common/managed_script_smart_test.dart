@@ -238,4 +238,122 @@ void main() {
     expect(types, contains('订阅 C-智能选择:smart'));
     expect(group(config, '默认代理')['proxies'], contains('订阅 C'));
   });
+
+  const chatGPTRoute =
+      "{'name':'ChatGPT','sets':[{'type':'geosite','tag':'openai'}],'target':'直连'}";
+  const chatGPTRoutePrelude = 'const bettboxRoutes = [$chatGPTRoute];';
+
+  test('custom service route gets a smart subgroup', () async {
+    final config = await generate({'智能选择': true}, prelude: chatGPTRoutePrelude);
+
+    expect(groupTypes(config), contains('ChatGPT-智能选择:smart'));
+    final types = groupTypes(config);
+    expect(
+      types.indexOf('ChatGPT-智能选择:smart'),
+      lessThan(types.indexOf('ChatGPT:select')),
+    );
+    final smart = group(config, 'ChatGPT-智能选择');
+    expect(smart['service'], 'openai');
+    expect(smart['proxies'], ['🇭🇰 HK 01', '🇭🇰 HK 02']);
+    expect(group(config, 'ChatGPT')['proxies'], [
+      'ChatGPT-智能选择',
+      '默认代理',
+      '手动选择',
+      '智能选择',
+      '香港',
+      '直连',
+    ]);
+  });
+
+  test('custom service route keeps its explicit default target', () async {
+    final config = await generate({'智能选择': true}, prelude: chatGPTRoutePrelude);
+
+    expect(group(config, 'ChatGPT')['default-selected'], '直连');
+  });
+
+  test('custom service route stays unchanged without smart select', () async {
+    final config = await generate({'自动选择': true}, prelude: chatGPTRoutePrelude);
+
+    expect(groupTypes(config), isNot(contains('ChatGPT-智能选择:smart')));
+    expect(
+      groups(config).where((group) => group['name'] == 'ChatGPT-智能选择'),
+      isEmpty,
+    );
+    expect(
+      groups(config).where(
+        (group) => group['type'] == 'smart' && group['name'] == 'ChatGPT-智能选择',
+      ),
+      isEmpty,
+    );
+  });
+
+  test('custom service route dedupes its derived smart name', () async {
+    const clashRoute =
+        "{'name':'ChatGPT-智能选择','sets':[{'type':'geosite','tag':'openai'}],'target':'直连'}";
+    Future<Map<String, dynamic>> withRoutes(String routes) =>
+        generate({'智能选择': true}, prelude: 'const bettboxRoutes = $routes;');
+
+    Set<String> serviceSmartGroups(Map<String, dynamic> config) => {
+      for (final group in groups(config))
+        if (group['type'] == 'smart' && group['service'] == 'openai')
+          group['name'] as String,
+    };
+
+    // The colliding route is declared first, so it owns `ChatGPT-智能选择` and the
+    // guard drops ChatGPT's derived name: one smart group, from the colliding
+    // route, and ChatGPT keeps its plain member list.
+    const clashFirst = '[$clashRoute,$chatGPTRoute]';
+    final clashFirstConfig = await withRoutes(clashFirst);
+    final clashFirstNames = [
+      for (final group in groups(clashFirstConfig)) group['name'] as String,
+    ];
+    expect(
+      clashFirstNames.toSet().length,
+      clashFirstNames.length,
+      reason: 'duplicate proxy group names in $clashFirst: $clashFirstNames',
+    );
+    final clashFirstChatGPT = group(clashFirstConfig, 'ChatGPT');
+    expect(clashFirstChatGPT['proxies'], isNot(contains('ChatGPT-智能选择')));
+    expect(clashFirstChatGPT['default-selected'], '直连');
+    // A removed guard would add a second smart group here.
+    expect(serviceSmartGroups(clashFirstConfig), {'ChatGPT-智能选择-智能选择'});
+
+    // ChatGPT comes first and claims the derived name, so the duplicate-named
+    // route is dropped instead and ChatGPT keeps exactly that one subgroup.
+    const chatGPTFirst = '[$chatGPTRoute,$clashRoute]';
+    final chatGPTFirstConfig = await withRoutes(chatGPTFirst);
+    final chatGPTFirstNames = [
+      for (final group in groups(chatGPTFirstConfig)) group['name'] as String,
+    ];
+    expect(
+      chatGPTFirstNames.toSet().length,
+      chatGPTFirstNames.length,
+      reason:
+          'duplicate proxy group names in $chatGPTFirst: $chatGPTFirstNames',
+    );
+    final chatGPTFirstChatGPT = group(chatGPTFirstConfig, 'ChatGPT');
+    expect((chatGPTFirstChatGPT['proxies'] as List).first, 'ChatGPT-智能选择');
+    expect(chatGPTFirstChatGPT['default-selected'], '直连');
+    expect(serviceSmartGroups(chatGPTFirstConfig), {'ChatGPT-智能选择'});
+  });
+
+  test('derived smart subgroup sorts before its parent', () async {
+    const clashRoute =
+        "{'name':'ChatGPT-智能选择','sets':[{'type':'geosite','tag':'openai'}],'target':'直连'}";
+    // The saved order names the derived group after its parent; the core parses
+    // groups in order, so a subgroup emitted later than its parent fails to load.
+    final config = await generate(
+      {'智能选择': true},
+      prelude:
+          "const bettboxRoutes = [$chatGPTRoute,$clashRoute];\n"
+          "const bettboxOrder = ['ChatGPT','ChatGPT-智能选择'];",
+    );
+
+    final types = groupTypes(config);
+    expect(
+      types.indexOf('ChatGPT-智能选择:smart'),
+      lessThan(types.indexOf('ChatGPT:select')),
+      reason: 'proxy group order: $types',
+    );
+  });
 }

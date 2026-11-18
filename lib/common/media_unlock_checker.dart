@@ -108,27 +108,6 @@ class MediaUnlockChecker {
     return dio;
   }
 
-  static const _openaiUnsupportedRegions = {
-    'CN',
-    'HK',
-    'MO',
-    'RU',
-    'IR',
-    'KP',
-    'SY',
-    'CU',
-    'VE',
-    'BY',
-    'AF',
-    'SS',
-    'YE',
-    'ZW',
-    'MM',
-    'SD',
-    'SO',
-    'CF',
-  };
-
   static const _claudeUnsupportedRegions = {
     'CN',
     'HK',
@@ -150,37 +129,6 @@ class MediaUnlockChecker {
     'SO',
     'CF',
     'VE',
-  };
-
-  static const _geminiUnsupportedRegions = {
-    'CN',
-    'CHN',
-    'RU',
-    'RUS',
-    'BY',
-    'BLR',
-    'IR',
-    'IRN',
-    'KP',
-    'PRK',
-    'SY',
-    'SYR',
-    'CU',
-    'CUB',
-    'VE',
-    'VEN',
-    'MM',
-    'MMR',
-    'SD',
-    'SDN',
-    'AF',
-    'AFG',
-    'SS',
-    'SSD',
-    'YE',
-    'YEM',
-    'ZW',
-    'ZWE',
   };
 
   String? _extractColoFromRay(String? ray) {
@@ -1135,7 +1083,7 @@ class MediaUnlockChecker {
     }
   }
 
-  Future<MediaUnlockResult> checkGemini() async {
+  Future<MediaUnlockResult> _checkGeminiPage(HtmlRegionProbe probe) async {
     final sw = Stopwatch()..start();
     final dio = _createDio(followRedirects: true);
     try {
@@ -1200,8 +1148,8 @@ class MediaUnlockChecker {
           body.contains('ご利用いただけません');
 
       final isBlockedRegion =
-          (region != null && _geminiUnsupportedRegions.contains(region)) ||
-          (rawRegion != null && _geminiUnsupportedRegions.contains(rawRegion));
+          (region != null && probe.blockedRegions.contains(region)) ||
+          (rawRegion != null && probe.blockedRegions.contains(rawRegion));
 
       final MediaUnlockStatus status;
       if (res.statusCode != 200 || isUnavailable || isBlockedRegion) {
@@ -1635,22 +1583,34 @@ class MediaUnlockChecker {
     }
   }
 
+  Future<MediaUnlockResult> _checkServiceType(ServiceType type) {
+    return switch (type.probe) {
+      TraceProbe probe => _checkCloudflareTrace(
+        type.platform,
+        probe.hosts.first,
+        fallbackDomains: probe.hosts.skip(1).toList(),
+        unsupportedRegions: probe.blockedRegions.isEmpty
+            ? null
+            : probe.blockedRegions,
+        fallbackUrl: probe.fallbackUrl,
+      ),
+      HtmlRegionProbe probe => _checkGeminiPage(probe),
+    };
+  }
+
   Future<MediaUnlockResult> checkPlatform(MediaPlatform platform) {
     final cancelToken = CancelToken();
     return runZoned(
       () {
         final checkFuture = switch (platform) {
-      MediaPlatform.openai => _checkCloudflareTrace(
-        MediaPlatform.openai,
-        'chatgpt.com',
-        unsupportedRegions: _openaiUnsupportedRegions,
+      MediaPlatform.openai || MediaPlatform.gemini => _checkServiceType(
+        serviceTypeByPlatform[platform]!,
       ),
       MediaPlatform.claude => _checkCloudflareTrace(
         MediaPlatform.claude,
         'api.anthropic.com',
         unsupportedRegions: _claudeUnsupportedRegions,
       ),
-      MediaPlatform.gemini => checkGemini(),
       MediaPlatform.grok => _checkCloudflareTrace(
         MediaPlatform.grok,
         'api.x.ai',
