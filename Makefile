@@ -8,3 +8,5 @@ android_arm64_core:
 	dart ./setup.dart android --arch arm64 --out core
 macos_arm64_core:
 	dart ./setup.dart macos --arch arm64  --out core
+lite_release:
+	./scripts/build-lite-release.sh
