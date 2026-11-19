@@ -349,6 +349,16 @@ void main() {
     expect(groupTypes(config), isNot(contains('YouTube-智能选择:smart')));
   });
 
+  test('service smart groups follow the group pin switch', () async {
+    final pinned = await generate({'智能选择': true});
+    expect(group(pinned, 'YouTube-智能选择')['pin'], 'group');
+    // 只有带 service 键的派生组带 pin；基础智能选择组保持轮换，不受影响。
+    expect(group(pinned, '智能选择').containsKey('pin'), isFalse);
+
+    final perSite = await generate({'智能选择': true, '智能选择整组固定': false});
+    expect(group(perSite, 'YouTube-智能选择')['pin'], 'site');
+  });
+
   test('built-in YouTube subgroup sorts before its parent', () async {
     final config = await generate(
       {'智能选择': true},

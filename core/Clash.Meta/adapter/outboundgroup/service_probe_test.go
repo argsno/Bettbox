@@ -604,6 +604,67 @@ func TestSmartUnwrapFollowsServicePin(t *testing.T) {
 	}
 }
 
+func TestNewSmartPinOption(t *testing.T) {
+	// The default and every unrecognized value keep the group pin; only an
+	// explicit pin: site reverts a service group to per-site memory.
+	cases := []struct {
+		pin  string
+		want bool
+	}{
+		{"", false},
+		{"group", false},
+		{" Group ", false},
+		{"site", true},
+		{"Site", true},
+		{"sticky", false}, // unknown: degrade with a warning
+	}
+	for _, tc := range cases {
+		s, err := NewSmart(GroupCommonOption{Name: "smart"}, SmartOption{Service: "gemini", Pin: tc.pin}, nil, nil)
+		if err != nil {
+			t.Fatalf("pin %q: unexpected error %v", tc.pin, err)
+		}
+		if s.pinSite != tc.want {
+			t.Fatalf("pin %q: pinSite=%t, want %t", tc.pin, s.pinSite, tc.want)
+		}
+	}
+}
+
+func TestSmartServiceGroupSitePinPerSiteMemory(t *testing.T) {
+	best := newFakeProxy("Best", 100)
+	recent := newFakeProxy("Recent", 110) // inside the plain band
+	s := newTestSmartWithProxies(best, recent)
+	s.service = "openai"
+	s.pinSite = true
+	now := time.Now()
+	s.rememberSite(&C.Metadata{Host: "chatgpt.com"}, "Recent", true, now.Add(-time.Minute))
+	s.lastProbe = now
+
+	// The record is per site: the site it served keeps its sticky pick...
+	for i := 0; i < 16; i++ {
+		if order := s.orderedCandidates(&C.Metadata{Host: "chatgpt.com"}, false); order[0].Name() != "Recent" {
+			t.Fatalf("the served site must keep its sticky member, got %v", names(order))
+		}
+	}
+	// ...while another destination of the same service rotates inside the
+	// band instead of inheriting the pin.
+	seen := make(map[string]bool, 2)
+	for i := 0; i < 100; i++ {
+		seen[s.orderedCandidates(&C.Metadata{Host: "cdn.example.org"}, false)[0].Name()] = true
+	}
+	if !seen["Best"] || !seen["Recent"] {
+		t.Fatalf("an unrelated destination must rotate inside the band, saw %v", seen)
+	}
+
+	// Now() and Unwrap report usage and score, not the per-site record.
+	s.reportUsed("Best")
+	if got := s.Now(); got != "Best" {
+		t.Fatalf("Now() = %q, want Best", got)
+	}
+	if proxy := s.Unwrap(nil, false); proxy == nil || proxy.Name() != "Best" {
+		t.Fatalf("Unwrap must stand for the best alive member, got %v", proxy)
+	}
+}
+
 func TestSmartGeneralGroupKeepsRotation(t *testing.T) {
 	a := newFakeProxy("A", 100)
 	b := newFakeProxy("B", 110)

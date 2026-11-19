@@ -4,7 +4,7 @@
  * 自定义分流远程规则集：@appshubcc https://github.com/appshubcc/bett-rules 
  */
 
-// @version 2026111903
+// @version 2026111904
 const Compatible_With_Bettbox = { ruleOptionsEnable: true };
 
 const ruleOptionsEnable = {
@@ -13,6 +13,10 @@ const ruleOptionsEnable = {
   // 在「自动选择」之外额外生成 smart 类型的「智能选择」组：
   // 按真实连接质量（首响应延迟、重传惩罚、失败冷却、按站点记忆）动态选路
   '智能选择': false,
+  // 服务智能组（AI/YouTube/ChatGPT 等带 service 键的派生 smart 组）整组固定单一节点：
+  // 内核把该组所有域名的成败记成一条记录，任一域名应答成功即固定整组用同一台机器，
+  // 失败、掉出分数带或探测判 blocked 时自动换下一台；关闭后回到按站点分别记忆。
+  '智能选择整组固定': true,
 
   'AI': true,
   'FCM': true,
@@ -1236,10 +1240,12 @@ function buildFunctionalGroups(filteredProxies, generatedRegionGroups) {
       }
     }
     if (serviceSmartName) {
+      // pin 由「智能选择整组固定」决定：group=整组一条记忆固定单节点，site=按站点分别记忆。
       functionalGroups.push({
         ...smartBaseOption,
         name: serviceSmartName,
         service: svc.service,
+        pin: ruleOptionsEnable['智能选择整组固定'] ? 'group' : 'site',
         proxies: [...allProxiesNames],
       });
       groupProxies = [serviceSmartName, ...groupProxies];

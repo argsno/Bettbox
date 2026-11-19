@@ -53,6 +53,7 @@ const (
 type SmartOption struct {
 	PolicyPriority string `group:"policy-priority,omitempty"`
 	Service        string `group:"service,omitempty"`
+	Pin            string `group:"pin,omitempty"`
 }
 
 type smartPriorityRule struct {
@@ -237,10 +238,14 @@ type Smart struct {
 	rankGen   uint64
 
 	// service is empty unless the group ranks members by their ability to
-	// reach one service and fixes on one member for everything it routes;
-	// verdicts holds the last decidable probe result per member, attempts the
-	// last probe try, decidable or not.
-	service   string
+	// reach one service and, unless pinSite is set, fixes on one member for
+	// everything it routes; verdicts holds the last decidable probe result
+	// per member, attempts the last probe try, decidable or not.
+	service string
+	// pinSite (pin: site) reverts a service group to per-site memory and
+	// in-band rotation: the sticky pick works per destination instead of
+	// fixing the whole group on one member.
+	pinSite   bool
 	verdicts  map[string]serviceVerdict
 	attempts  map[string]serviceProbeAttempt
 	lastProbe time.Time
@@ -264,7 +269,7 @@ func (s *Smart) Now() string {
 
 	// A service group fixes on one member for everything, so the panel must
 	// name that member, not the best-scored or most-used one.
-	if s.service != "" {
+	if s.serviceGroupPin() {
 		if item := s.servicePick(proxies, time.Now()); item != nil {
 			return item.proxy.Name()
 		}
@@ -331,7 +336,7 @@ func (s *Smart) servicePick(proxies []C.Proxy, now time.Time) *smartCandidate {
 		}
 	}
 	s.mu.Unlock()
-	pick, ok := preferredBandPick(ranked, entries, now, true)
+	pick, ok := preferredBandPick(ranked, entries, now, true, true)
 	if !ok {
 		return nil
 	}
@@ -547,7 +552,7 @@ func (s *Smart) representativeProxy(metadata *C.Metadata, touch bool) C.Proxy {
 	}
 	// A service group stands for the member it fixes on, so capability
 	// questions are answered by the machine the traffic actually uses.
-	if s.service != "" {
+	if s.serviceGroupPin() {
 		if item := s.servicePick(proxies, now); item != nil {
 			return item.proxy
 		}
@@ -683,13 +688,14 @@ func stickySitePick(ranked []smartCandidate, preferred []int, entries map[string
 }
 
 // preferredBandPick returns the first choice among the policies inside the
-// preferred band around the best usable score. Service groups pin to the band
-// member with the newest success -- Google and OpenAI tie sessions to the
-// egress IP, so one member serves the whole service -- and, until a success is
-// remembered, fix on the best band member so the first burst of connections
-// concentrates on one machine instead of spreading across the band. General
-// groups keep the in-band rotation: spreading load is the point there.
-func preferredBandPick(ranked []smartCandidate, entries map[string]smartSiteEntry, now time.Time, service bool) (int, bool) {
+// preferred band around the best usable score. Sticky picks the band member
+// with the newest success -- Google and OpenAI tie sessions to the egress IP,
+// so a service group keeps answering on one member. Deterministic fixes the
+// cold start on the best band member so the first burst of connections
+// concentrates on one machine and forms the pin; without it the pick rotates
+// randomly inside the band, spreading load by design. General groups pass
+// neither flag.
+func preferredBandPick(ranked []smartCandidate, entries map[string]smartSiteEntry, now time.Time, sticky, deterministic bool) (int, bool) {
 	best := 0.0
 	hasBest := false
 	for _, item := range ranked {
@@ -728,10 +734,12 @@ func preferredBandPick(ranked []smartCandidate, entries map[string]smartSiteEntr
 	if len(preferred) == 0 {
 		return -1, false
 	}
-	if service {
-		if sticky, ok := stickySitePick(ranked, preferred, entries, now); ok {
-			return sticky, true
+	if sticky {
+		if member, ok := stickySitePick(ranked, preferred, entries, now); ok {
+			return member, true
 		}
+	}
+	if deterministic {
 		return preferred[0], true
 	}
 	return preferred[rand.Intn(len(preferred))], true
@@ -842,7 +850,7 @@ func (s *Smart) orderedCandidates(metadata *C.Metadata, touch bool) []C.Proxy {
 	}
 
 	if firstPick < 0 {
-		if pick, ok := preferredBandPick(ranked, siteEntries, now, s.service != ""); ok {
+		if pick, ok := preferredBandPick(ranked, siteEntries, now, s.service != "", s.serviceGroupPin()); ok {
 			firstPick = pick
 		} else {
 			// nothing preferred: still try a live policy before a dead one, even
@@ -986,11 +994,19 @@ func (s *Smart) reportUsed(name string) {
 	s.mu.Unlock()
 }
 
-// memoryKey is the key a connection's outcome records under. A general group
-// remembers per destination site; a service group keeps one record, so the
-// member that served any domain of the service is pinned for them all.
+// serviceGroupPin reports whether the group fixes on one member for
+// everything it routes: any service group unless pin: site reverts it to
+// per-site memory.
+func (s *Smart) serviceGroupPin() bool {
+	return s.service != "" && !s.pinSite
+}
+
+// memoryKey is the key a connection's outcome records under. A group pin
+// keeps one record for the whole service group, so the member that served
+// any domain is pinned for them all; every other group remembers per
+// destination site.
 func (s *Smart) memoryKey(metadata *C.Metadata) string {
-	if s.service != "" {
+	if s.serviceGroupPin() {
 		return s.service
 	}
 	return getKey(metadata)
@@ -1320,6 +1336,20 @@ func (c *smartPacketConn) Upstream() any {
 
 var _ C.PacketConn = (*smartPacketConn)(nil)
 
+// normalizePinMode maps the configured pin value onto its struct form. A
+// typo must degrade to the default instead of breaking the config, matching
+// how an unknown service behaves.
+func normalizePinMode(value string) (pinSite bool, err error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", "group":
+		return false, nil
+	case "site":
+		return true, nil
+	default:
+		return false, fmt.Errorf("unknown pin %q, want \"group\" or \"site\"", value)
+	}
+}
+
 func NewSmart(option GroupCommonOption, smartOption SmartOption, emptyFallback C.Proxy, providers []P.ProxyProvider) (*Smart, error) {
 	priority, err := parsePolicyPriority(smartOption.PolicyPriority)
 	if err != nil {
@@ -1331,6 +1361,11 @@ func NewSmart(option GroupCommonOption, smartOption SmartOption, emptyFallback C
 		// typo must degrade to plain scoring instead of breaking the config.
 		log.Warnln("[Smart] %s: %v, service ranking disabled", option.Name, err)
 		service = ""
+	}
+	pinSite, err := normalizePinMode(smartOption.Pin)
+	if err != nil {
+		log.Warnln("[Smart] %s: %v, pin stays on the group", option.Name, err)
+		pinSite = false
 	}
 	return &Smart{
 		GroupBase: NewGroupBase(GroupBaseOption{
@@ -1353,6 +1388,7 @@ func NewSmart(option GroupCommonOption, smartOption SmartOption, emptyFallback C
 		sites:          make(map[string]*smartSiteRecord),
 		priority:       priority,
 		service:        service,
+		pinSite:        pinSite,
 		verdicts:       make(map[string]serviceVerdict),
 		attempts:       make(map[string]serviceProbeAttempt),
 	}, nil

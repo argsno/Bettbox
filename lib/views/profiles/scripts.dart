@@ -37,6 +37,7 @@ const _optionIcons = {
   '隐藏地区手动选择组': Icons.visibility_off,
   '分流组添加所有节点': Icons.playlist_add,
   '智能选择': Icons.bolt,
+  '智能选择整组固定': Icons.push_pin,
   '生成高低倍率组': Icons.leaderboard_outlined,
   '过滤低倍率节点': Icons.trending_down,
   '过滤高倍率节点': Icons.trending_up,
