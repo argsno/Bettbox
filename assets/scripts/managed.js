@@ -4,7 +4,7 @@
  * 自定义分流远程规则集：@appshubcc https://github.com/appshubcc/bett-rules 
  */
 
-// @version 2026111912
+// @version 2026111913
 const Compatible_With_Bettbox = { ruleOptionsEnable: true };
 
 const ruleOptionsEnable = {
@@ -53,7 +53,7 @@ const ruleOptionsEnable = {
   '其他节点': true,
   // 为节点名命中流媒体关键词（streamingRegionRegex：流媒体/解锁/Netflix/Disney 等）
   // 的节点生成「流媒体」组；无命中时不生成，命中地区的节点仍同时归入对应地区组。
-  '流媒体': true,
+  '生成流媒体组': true,
   '禁用内核QUIC流量': true,
   '优先国内DNS加速': true,
   '优先连接IPv6节点': false,
@@ -962,7 +962,7 @@ function createSubscriptionGroups(proxies) {
  */
 function buildRegionGroups(filteredProxies) {
   const generateRateGroupEnabled = ruleOptionsEnable.生成高低倍率组;
-  const generateStreamingGroupEnabled = ruleOptionsEnable[streamingRegionName];
+  const generateStreamingGroupEnabled = ruleOptionsEnable.生成流媒体组;
   const otherGroupEnabled = ruleOptionsEnable.其他节点;
 
   const regionGroups = Object.fromEntries(allRegionDefinitions.map(({ name }) => [name, []]));

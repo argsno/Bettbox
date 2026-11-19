@@ -264,7 +264,7 @@ void main() {
   });
 
   test('the streaming group switch removes the group but keeps its nodes', () async {
-    final config = await generate({'流媒体': false}, proxies: [
+    final config = await generate({'生成流媒体组': false}, proxies: [
       netflixProxy,
       streamingProxy,
     ]);
