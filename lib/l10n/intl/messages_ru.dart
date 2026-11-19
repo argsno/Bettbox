@@ -1681,6 +1681,9 @@ class MessageLookup extends MessageLookupByLibrary {
     "otherContributors": MessageLookupByLibrary.simpleMessage(
       "Другие участники (в случайном порядке)",
     ),
+    "otherGroupOptionSubtitle": MessageLookupByLibrary.simpleMessage(
+      "При включении узлы без региона больше не попадают в группу 其他节点, а остаются в группах со всеми узлами",
+    ),
     "otherSettings": MessageLookupByLibrary.simpleMessage(
       "Расширенные инструменты",
     ),
@@ -1892,6 +1895,9 @@ class MessageLookup extends MessageLookupByLibrary {
     "regionGroups": MessageLookupByLibrary.simpleMessage("Региональные группы"),
     "regionGroupsTip": MessageLookupByLibrary.simpleMessage(
       "Регионы без подходящих узлов не создаются; узлы без региона попадают в 其他节点 (прочие узлы)",
+    ),
+    "regionGroupsTipNoOther": MessageLookupByLibrary.simpleMessage(
+      "Регионы без подходящих узлов не создаются; узлы без региона остаются только в группах со всеми узлами",
     ),
     "regionName": MessageLookupByLibrary.simpleMessage("Название региона"),
     "regionRegex": MessageLookupByLibrary.simpleMessage("Регулярное выражение"),

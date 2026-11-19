@@ -1625,6 +1625,9 @@ class MessageLookup extends MessageLookupByLibrary {
     "otherContributors": MessageLookupByLibrary.simpleMessage(
       "مشارکت‌کنندگان دیگر (ترتیب تصادفی)",
     ),
+    "otherGroupOptionSubtitle": MessageLookupByLibrary.simpleMessage(
+      "با فعال بودن، گره‌های بدون منطقه دیگر وارد گروه 其他节点 نمی‌شوند و در گروه‌های همه گره‌ها باقی می‌مانند",
+    ),
     "otherSettings": MessageLookupByLibrary.simpleMessage("ابزارهای پیشرفته"),
     "otherSettingsDesc": MessageLookupByLibrary.simpleMessage(
       "تغییر تنظیمات ابزارهای پیشرفته",
@@ -1836,6 +1839,9 @@ class MessageLookup extends MessageLookupByLibrary {
     "regionGroups": MessageLookupByLibrary.simpleMessage("گروه‌های منطقه‌ای"),
     "regionGroupsTip": MessageLookupByLibrary.simpleMessage(
       "منطقه‌هایی که گره منطبق ندارند ساخته نمی‌شوند؛ گره‌هایی که با هیچ منطقه‌ای منطبق نیستند به 其他节点 (سایر گره‌ها) می‌روند",
+    ),
+    "regionGroupsTipNoOther": MessageLookupByLibrary.simpleMessage(
+      "منطقه‌های بدون گره مطابق ساخته نمی‌شوند؛ گره‌های بدون منطقه فقط در گروه‌های همه گره‌ها باقی می‌مانند",
     ),
     "regionName": MessageLookupByLibrary.simpleMessage("نام منطقه"),
     "regionRegex": MessageLookupByLibrary.simpleMessage("عبارت باقاعده منطبق"),

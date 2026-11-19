@@ -1608,6 +1608,9 @@ class MessageLookup extends MessageLookupByLibrary {
     "otherContributors": MessageLookupByLibrary.simpleMessage(
       "Other Contributors (Random Order)",
     ),
+    "otherGroupOptionSubtitle": MessageLookupByLibrary.simpleMessage(
+      "When on, unmatched nodes no longer form an 其他节点 group; they stay in the all-node groups",
+    ),
     "otherSettings": MessageLookupByLibrary.simpleMessage("Enhanced Tools"),
     "otherSettingsDesc": MessageLookupByLibrary.simpleMessage(
       "Modify enhanced tool settings",
@@ -1811,6 +1814,9 @@ class MessageLookup extends MessageLookupByLibrary {
     "regionGroups": MessageLookupByLibrary.simpleMessage("Region groups"),
     "regionGroupsTip": MessageLookupByLibrary.simpleMessage(
       "Regions without matching nodes are skipped; nodes that match no region go to 其他节点 (other nodes)",
+    ),
+    "regionGroupsTipNoOther": MessageLookupByLibrary.simpleMessage(
+      "Regions without matching nodes are skipped; unmatched nodes stay reachable in the all-node groups",
     ),
     "regionName": MessageLookupByLibrary.simpleMessage("Region Name"),
     "regionRegex": MessageLookupByLibrary.simpleMessage("Matching Regex"),
