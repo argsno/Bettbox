@@ -17,9 +17,9 @@ const _largeRuleSetCount = 10000;
 // missing key (older script) keeps the row hidden.
 const _otherGroupOptionKey = '其他节点';
 
-// Same trick for the node-matched streaming group: the row only appears when
-// the script declares the option, and the group is only generated when the
-// airport actually has streaming-tagged nodes.
+// Same trick for the node-matched streaming group: the toggle lives in the
+// other-options sheet; here it only guards the custom-region name so a user
+// region never collides with the generated group.
 const _streamingGroupOptionKey = '流媒体';
 
 final _searchKeyPattern = RegExp(r'[^\p{L}\p{N}]', unicode: true);
@@ -343,8 +343,7 @@ class _ManagedOptionsSheetState extends ConsumerState<ManagedOptionsSheet> {
       _others = [
         for (final key in options.keys)
           if (!policyGroupOptions.contains(key) &&
-              key != _otherGroupOptionKey &&
-              key != _streamingGroupOptionKey)
+              key != _otherGroupOptionKey)
             key,
       ];
       _options = options;
@@ -528,8 +527,7 @@ class _ManagedOptionsSheetState extends ConsumerState<ManagedOptionsSheet> {
         icons: _regionIcons,
         enabled: _regions,
         otherGroupOption: _options[_otherGroupOptionKey],
-        streamingGroupOption: _options[_streamingGroupOptionKey],
-        onSave: (enabled, customRegions, otherGroupOption, streamingGroupOption) {
+        onSave: (enabled, customRegions, otherGroupOption) {
           if (!mounted) return;
           setState(() {
             _enabledRegions = enabled;
@@ -537,9 +535,6 @@ class _ManagedOptionsSheetState extends ConsumerState<ManagedOptionsSheet> {
             _customRegions = customRegions;
             if (otherGroupOption != null) {
               _options[_otherGroupOptionKey] = otherGroupOption;
-            }
-            if (streamingGroupOption != null) {
-              _options[_streamingGroupOptionKey] = streamingGroupOption;
             }
             _regionIcons = {
               for (final region in catalog.regions)
@@ -907,12 +902,10 @@ class _RegionsSheet extends StatefulWidget {
   // Null when the script does not declare the option: the row stays hidden
   // so an older script never shows a dead switch.
   final bool? otherGroupOption;
-  final bool? streamingGroupOption;
   final void Function(
     List<String> enabled,
     List<CustomRegion> customRegions,
     bool? otherGroupOption,
-    bool? streamingGroupOption,
   ) onSave;
 
   const _RegionsSheet({
@@ -922,7 +915,6 @@ class _RegionsSheet extends StatefulWidget {
     required this.icons,
     required this.enabled,
     this.otherGroupOption,
-    this.streamingGroupOption,
     required this.onSave,
   });
 
@@ -934,7 +926,6 @@ class _RegionsSheetState extends State<_RegionsSheet> {
   late final Set<String> _enabled = widget.enabled.toSet();
   late final List<CustomRegion> _customRegions = List.of(widget.customRegions);
   late bool? _otherGroupOption = widget.otherGroupOption;
-  late bool? _streamingGroupOption = widget.streamingGroupOption;
   bool _dirty = false;
 
   Future<void> _handleSave() async {
@@ -946,7 +937,6 @@ class _RegionsSheetState extends State<_RegionsSheet> {
       [for (final name in allNames) if (_enabled.contains(name)) name],
       _customRegions,
       _otherGroupOption,
-      _streamingGroupOption,
     );
     _dirty = false;
     if (mounted) Navigator.of(context).pop();
@@ -1032,20 +1022,9 @@ class _RegionsSheetState extends State<_RegionsSheet> {
   Widget build(BuildContext context) {
     final regions = widget.regions;
     final otherOptionVisible = _otherGroupOption != null;
-    final streamingOptionVisible = _streamingGroupOption != null;
-    // Node-matched option rows come after the regions, mirroring the order the
-    // script generates the groups in: regions, streaming, other nodes.
+    // The other-node row closes the list, matching where the script emits the
+    // group: after every region group.
     final optionRows = [
-      if (streamingOptionVisible)
-        _optionRow(
-          name: _streamingGroupOptionKey,
-          icon: 'Streaming.svg',
-          value: _streamingGroupOption!,
-          onChanged: (value) => setState(() {
-            _streamingGroupOption = value;
-            _dirty = true;
-          }),
-        ),
       if (otherOptionVisible)
         _optionRow(
           name: _otherGroupOptionKey,
