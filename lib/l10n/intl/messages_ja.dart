@@ -1349,9 +1349,6 @@ class MessageLookup extends MessageLookupByLibrary {
     "organizationDomain": MessageLookupByLibrary.simpleMessage("組織 / ドメイン"),
     "other": MessageLookupByLibrary.simpleMessage("その他"),
     "otherContributors": MessageLookupByLibrary.simpleMessage("その他の貢献者（ランダム順）"),
-    "otherGroupOptionSubtitle": MessageLookupByLibrary.simpleMessage(
-      "オンにすると、どの地域にも該当しないノードは「其他节点」グループに入らず、全ノードを含むグループに残ります",
-    ),
     "otherSettings": MessageLookupByLibrary.simpleMessage("拡張ツール"),
     "otherSettingsDesc": MessageLookupByLibrary.simpleMessage("拡張ツールの設定を変更"),
     "outboundMode": MessageLookupByLibrary.simpleMessage("アウトバウンドモード"),
@@ -1513,12 +1510,6 @@ class MessageLookup extends MessageLookupByLibrary {
     "regenerate": MessageLookupByLibrary.simpleMessage("再生成"),
     "regexInvalid": MessageLookupByLibrary.simpleMessage("正規表現の形式が無効です"),
     "regionGroups": MessageLookupByLibrary.simpleMessage("地域グループ"),
-    "regionGroupsTip": MessageLookupByLibrary.simpleMessage(
-      "該当ノードがない地域はグループを作成しません。どの地域にも該当しないノードは「其他节点」(その他のノード)に入ります",
-    ),
-    "regionGroupsTipNoOther": MessageLookupByLibrary.simpleMessage(
-      "該当ノードがない地域はグループを作成しません。どの地域にも該当しないノードは全ノードを含むグループにのみ残ります",
-    ),
     "regionName": MessageLookupByLibrary.simpleMessage("国/地域名"),
     "regionRegex": MessageLookupByLibrary.simpleMessage("マッチング正規表現"),
     "reject": MessageLookupByLibrary.simpleMessage("ブロック"),

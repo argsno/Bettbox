@@ -1358,9 +1358,6 @@ class MessageLookup extends MessageLookupByLibrary {
     "otherContributors": MessageLookupByLibrary.simpleMessage(
       "기타 기여자 (무작위 정렬)",
     ),
-    "otherGroupOptionSubtitle": MessageLookupByLibrary.simpleMessage(
-      "켜면 어느 지역에도 해당하지 않는 노드는 「其他节点」 그룹에 들어가지 않고, 전체 노드를 포함하는 그룹에 남습니다",
-    ),
     "otherSettings": MessageLookupByLibrary.simpleMessage("향상된 도구"),
     "otherSettingsDesc": MessageLookupByLibrary.simpleMessage("향상된 도구 설정 수정"),
     "outboundMode": MessageLookupByLibrary.simpleMessage("아웃바운드 모드"),
@@ -1518,12 +1515,6 @@ class MessageLookup extends MessageLookupByLibrary {
     "regenerate": MessageLookupByLibrary.simpleMessage("다시 생성"),
     "regexInvalid": MessageLookupByLibrary.simpleMessage("정규식 형식이 잘못되었습니다"),
     "regionGroups": MessageLookupByLibrary.simpleMessage("지역 그룹"),
-    "regionGroupsTip": MessageLookupByLibrary.simpleMessage(
-      "일치하는 노드가 없는 지역은 그룹을 만들지 않으며, 어느 지역에도 해당하지 않는 노드는 「其他节点」(기타 노드)로 분류됩니다",
-    ),
-    "regionGroupsTipNoOther": MessageLookupByLibrary.simpleMessage(
-      "일치하는 노드가 없는 지역은 그룹을 만들지 않으며, 어느 지역에도 해당하지 않는 노드는 전체 노드를 포함하는 그룹에만 남습니다",
-    ),
     "regionName": MessageLookupByLibrary.simpleMessage("국가/지역 이름"),
     "regionRegex": MessageLookupByLibrary.simpleMessage("일치 정규식"),
     "reject": MessageLookupByLibrary.simpleMessage("차단"),

@@ -1223,9 +1223,6 @@ class MessageLookup extends MessageLookupByLibrary {
     "organizationDomain": MessageLookupByLibrary.simpleMessage("組織 / 域名"),
     "other": MessageLookupByLibrary.simpleMessage("其他"),
     "otherContributors": MessageLookupByLibrary.simpleMessage("其他貢獻者(隨機排序)"),
-    "otherGroupOptionSubtitle": MessageLookupByLibrary.simpleMessage(
-      "開啟後未符合任何地區的節點不再歸入「其他节点」分組，仍保留在包含全部節點的分組中",
-    ),
     "otherSettings": MessageLookupByLibrary.simpleMessage("增強工具"),
     "otherSettingsDesc": MessageLookupByLibrary.simpleMessage("修改增強工具設定"),
     "outboundMode": MessageLookupByLibrary.simpleMessage("出站模式"),
@@ -1373,12 +1370,6 @@ class MessageLookup extends MessageLookupByLibrary {
     "regenerate": MessageLookupByLibrary.simpleMessage("重新生成"),
     "regexInvalid": MessageLookupByLibrary.simpleMessage("規則運算式格式錯誤"),
     "regionGroups": MessageLookupByLibrary.simpleMessage("地區分組"),
-    "regionGroupsTip": MessageLookupByLibrary.simpleMessage(
-      "沒有符合節點的地區不會產生策略組，未符合任何地區的節點歸入「其他节点」",
-    ),
-    "regionGroupsTipNoOther": MessageLookupByLibrary.simpleMessage(
-      "沒有符合節點的地區不會產生策略組，未符合任何地區的節點僅保留在包含全部節點的分組中",
-    ),
     "regionName": MessageLookupByLibrary.simpleMessage("國家名稱"),
     "regionRegex": MessageLookupByLibrary.simpleMessage("匹配正則"),
     "reject": MessageLookupByLibrary.simpleMessage("攔截"),

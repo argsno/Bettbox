@@ -350,16 +350,6 @@ class AppLocalizations {
     );
   }
 
-  /// `When on, unmatched nodes no longer form an 其他节点 group; they stay in the all-node groups`
-  String get otherGroupOptionSubtitle {
-    return Intl.message(
-      'When on, unmatched nodes no longer form an 其他节点 group; they stay in the all-node groups',
-      name: 'otherGroupOptionSubtitle',
-      desc: '',
-      args: [],
-    );
-  }
-
   /// `Smart Auto-Stop`
   String get smartAutoStop {
     return Intl.message(
@@ -10409,26 +10399,6 @@ class AppLocalizations {
     return Intl.message(
       'Region groups',
       name: 'regionGroups',
-      desc: '',
-      args: [],
-    );
-  }
-
-  /// `Regions without matching nodes are skipped; nodes that match no region go to 其他节点 (other nodes)`
-  String get regionGroupsTip {
-    return Intl.message(
-      'Regions without matching nodes are skipped; nodes that match no region go to 其他节点 (other nodes)',
-      name: 'regionGroupsTip',
-      desc: '',
-      args: [],
-    );
-  }
-
-  /// `Regions without matching nodes are skipped; unmatched nodes stay reachable in the all-node groups`
-  String get regionGroupsTipNoOther {
-    return Intl.message(
-      'Regions without matching nodes are skipped; unmatched nodes stay reachable in the all-node groups',
-      name: 'regionGroupsTipNoOther',
       desc: '',
       args: [],
     );

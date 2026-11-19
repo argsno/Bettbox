@@ -187,7 +187,7 @@ void main() {
   });
 
   test('the other-node group switch removes the group but keeps its nodes', () async {
-    final config = await generate({'关闭其他节点组': true}, proxies: [
+    final config = await generate({'其他节点': false}, proxies: [
       {
         'name': 'HK 01',
         'type': 'ss',

@@ -12,10 +12,10 @@ import 'package:material_ui/material_ui.dart';
 const _rejectTarget = 'REJECT';
 const _largeRuleSetCount = 10000;
 
-// The script option that omits the other-node group. Its switch lives with
-// the region toggles, not in the generic option list, so it is excluded from
-// _others and rendered by the regions sheet instead.
-const _otherGroupOptionKey = '关闭其他节点组';
+// The script option toggling the other-node group. Named like a region so
+// the row reads as "include 其他节点", matching the region switches; a
+// missing key (older script) keeps the row hidden.
+const _otherGroupOptionKey = '其他节点';
 
 final _searchKeyPattern = RegExp(r'[^\p{L}\p{N}]', unicode: true);
 
@@ -520,15 +520,15 @@ class _ManagedOptionsSheetState extends ConsumerState<ManagedOptionsSheet> {
         customRegions: _customRegions,
         icons: _regionIcons,
         enabled: _regions,
-        otherGroupDisabled: _options[_otherGroupOptionKey],
-        onSave: (enabled, customRegions, otherGroupDisabled) {
+        otherGroupOption: _options[_otherGroupOptionKey],
+        onSave: (enabled, customRegions, otherGroupOption) {
           if (!mounted) return;
           setState(() {
             _enabledRegions = enabled;
             _regions = enabled;
             _customRegions = customRegions;
-            if (otherGroupDisabled != null) {
-              _options[_otherGroupOptionKey] = otherGroupDisabled;
+            if (otherGroupOption != null) {
+              _options[_otherGroupOptionKey] = otherGroupOption;
             }
             _regionIcons = {
               for (final region in catalog.regions)
@@ -893,13 +893,13 @@ class _RegionsSheet extends StatefulWidget {
   final List<CustomRegion> customRegions;
   final Map<String, String?> icons;
   final List<String> enabled;
-  // Null when the script does not declare the other-node option: the switch
-  // stays hidden so an older script never shows a dead toggle.
-  final bool? otherGroupDisabled;
+  // Null when the script does not declare the option: the row stays hidden
+  // so an older script never shows a dead switch.
+  final bool? otherGroupOption;
   final void Function(
     List<String> enabled,
     List<CustomRegion> customRegions,
-    bool? otherGroupDisabled,
+    bool? otherGroupOption,
   ) onSave;
 
   const _RegionsSheet({
@@ -908,7 +908,7 @@ class _RegionsSheet extends StatefulWidget {
     this.customRegions = const [],
     required this.icons,
     required this.enabled,
-    this.otherGroupDisabled,
+    this.otherGroupOption,
     required this.onSave,
   });
 
@@ -919,7 +919,7 @@ class _RegionsSheet extends StatefulWidget {
 class _RegionsSheetState extends State<_RegionsSheet> {
   late final Set<String> _enabled = widget.enabled.toSet();
   late final List<CustomRegion> _customRegions = List.of(widget.customRegions);
-  late bool? _otherGroupDisabled = widget.otherGroupDisabled;
+  late bool? _otherGroupOption = widget.otherGroupOption;
   bool _dirty = false;
 
   Future<void> _handleSave() async {
@@ -930,7 +930,7 @@ class _RegionsSheetState extends State<_RegionsSheet> {
     widget.onSave([
       for (final name in allNames)
         if (_enabled.contains(name)) name,
-    ], _customRegions, _otherGroupDisabled);
+    ], _customRegions, _otherGroupOption);
     _dirty = false;
     if (mounted) Navigator.of(context).pop();
   }
@@ -992,7 +992,7 @@ class _RegionsSheetState extends State<_RegionsSheet> {
   @override
   Widget build(BuildContext context) {
     final regions = widget.regions;
-    final otherOptionVisible = _otherGroupDisabled != null;
+    final otherOptionVisible = _otherGroupOption != null;
     return CommonPopScope(
       onPop: _confirmDiscard,
       child: AdaptiveSheetScaffold(
@@ -1015,22 +1015,10 @@ class _RegionsSheetState extends State<_RegionsSheet> {
           padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
           itemCount: regions.length +
               _customRegions.length +
-              1 +
               (otherOptionVisible ? 1 : 0),
           itemBuilder: (context, index) {
-            if (index == 0) {
-              return Padding(
-                padding: const EdgeInsets.fromLTRB(8, 4, 8, 8),
-                child: Text(
-                  _otherGroupDisabled == true
-                      ? appLocalizations.regionGroupsTipNoOther
-                      : appLocalizations.regionGroupsTip,
-                  style: context.textTheme.labelSmall?.toLight,
-                ),
-              );
-            }
-            if (index <= regions.length) {
-              final region = regions[index - 1];
+            if (index < regions.length) {
+              final region = regions[index];
               return Padding(
                 padding: const EdgeInsets.symmetric(vertical: 4),
                 child: CommonCard(
@@ -1055,25 +1043,19 @@ class _RegionsSheetState extends State<_RegionsSheet> {
               );
             }
             if (otherOptionVisible &&
-                index == regions.length + _customRegions.length + 1) {
+                index == regions.length + _customRegions.length) {
               return Padding(
                 padding: const EdgeInsets.symmetric(vertical: 4),
                 child: CommonCard(
                   type: CommonCardType.filled,
                   child: ListTile(
                     contentPadding: const EdgeInsets.symmetric(horizontal: 16),
-                    leading: const Icon(Icons.location_off),
+                    leading: _RouteIcon(url: routeIconUrl('WorldMap.svg')),
                     title: const Text(_otherGroupOptionKey),
-                    subtitle: Text(
-                      appLocalizations.otherGroupOptionSubtitle,
-                      maxLines: 2,
-                      overflow: TextOverflow.ellipsis,
-                      style: context.textTheme.bodySmall?.toLight,
-                    ),
                     trailing: Switch(
-                      value: _otherGroupDisabled!,
+                      value: _otherGroupOption!,
                       onChanged: (value) => setState(() {
-                        _otherGroupDisabled = value;
+                        _otherGroupOption = value;
                         _dirty = true;
                       }),
                     ),
@@ -1081,7 +1063,7 @@ class _RegionsSheetState extends State<_RegionsSheet> {
                 ),
               );
             }
-            final customIndex = index - 1 - regions.length;
+            final customIndex = index - regions.length;
             final customRegion = _customRegions[customIndex];
             return Padding(
               padding: const EdgeInsets.symmetric(vertical: 4),
