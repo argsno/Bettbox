@@ -22,29 +22,32 @@ void main() {
   Future<Map<String, dynamic>> generate(
     Map<String, bool> options, {
     String prelude = '',
+    List<Map<String, Object?>>? proxies,
   }) async {
     final input = File('${directory.path}/input.json');
     final output = File('${directory.path}/output.json');
     input.writeAsStringSync(
       json.encode({
-        'proxies': [
-          {
-            'name': 'HK 01',
-            'type': 'ss',
-            'server': 'hk.example.com',
-            'port': 443,
-            'cipher': 'aes-128-gcm',
-            'password': 'pw',
-          },
-          {
-            'name': 'HK 02',
-            'type': 'ss',
-            'server': 'hk2.example.com',
-            'port': 443,
-            'cipher': 'aes-128-gcm',
-            'password': 'pw',
-          },
-        ],
+        'proxies':
+            proxies ??
+            [
+              {
+                'name': 'HK 01',
+                'type': 'ss',
+                'server': 'hk.example.com',
+                'port': 443,
+                'cipher': 'aes-128-gcm',
+                'password': 'pw',
+              },
+              {
+                'name': 'HK 02',
+                'type': 'ss',
+                'server': 'hk2.example.com',
+                'port': 443,
+                'cipher': 'aes-128-gcm',
+                'password': 'pw',
+              },
+            ],
         'proxy-groups': <Object>[],
         'rules': <Object>[],
       }),
@@ -146,6 +149,68 @@ void main() {
       types.indexOf('香港-智能选择:smart'),
       lessThan(types.indexOf('香港:select')),
     );
+  });
+
+  final mysteryProxy = {
+    'name': 'Mystery 01',
+    'type': 'ss',
+    'server': 'mystery.example.com',
+    'port': 443,
+    'cipher': 'aes-128-gcm',
+    'password': 'pw',
+  };
+
+  test('unmatched nodes form the other-node group by default', () async {
+    final config = await generate({}, proxies: [
+      {
+        'name': 'HK 01',
+        'type': 'ss',
+        'server': 'hk.example.com',
+        'port': 443,
+        'cipher': 'aes-128-gcm',
+        'password': 'pw',
+      },
+      {
+        'name': 'HK 02',
+        'type': 'ss',
+        'server': 'hk2.example.com',
+        'port': 443,
+        'cipher': 'aes-128-gcm',
+        'password': 'pw',
+      },
+      mysteryProxy,
+    ]);
+    expect(groupTypes(config), contains('其他节点:select'));
+    expect(group(config, '其他节点')['proxies'], ['Mystery 01']);
+    expect(group(config, '默认代理')['proxies'], contains('其他节点'));
+    expect(group(config, 'AI')['proxies'], contains('其他节点'));
+  });
+
+  test('the other-node group switch removes the group but keeps its nodes', () async {
+    final config = await generate({'关闭其他节点组': true}, proxies: [
+      {
+        'name': 'HK 01',
+        'type': 'ss',
+        'server': 'hk.example.com',
+        'port': 443,
+        'cipher': 'aes-128-gcm',
+        'password': 'pw',
+      },
+      {
+        'name': 'HK 02',
+        'type': 'ss',
+        'server': 'hk2.example.com',
+        'port': 443,
+        'cipher': 'aes-128-gcm',
+        'password': 'pw',
+      },
+      mysteryProxy,
+    ]);
+    final names = [for (final g in groups(config)) g['name'] as String];
+    expect(names, isNot(contains('其他节点')));
+    expect(group(config, '默认代理')['proxies'], isNot(contains('其他节点')));
+    expect(group(config, 'AI')['proxies'], isNot(contains('其他节点')));
+    expect(group(config, '手动选择')['proxies'], contains('Mystery 01'));
   });
 
   test('minimal mode adds smart select too', () async {

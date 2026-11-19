@@ -4,7 +4,7 @@
  * 自定义分流远程规则集：@appshubcc https://github.com/appshubcc/bett-rules 
  */
 
-// @version 2026111811
+// @version 2026111903
 const Compatible_With_Bettbox = { ruleOptionsEnable: true };
 
 const ruleOptionsEnable = {
@@ -44,6 +44,9 @@ const ruleOptionsEnable = {
   '过滤低倍率节点': false,
   '过滤高倍率节点': false,
   '过滤非地区节点': true,
+  // 不为未命中任何启用地区的节点生成「其他节点」组；这些节点仍保留在
+  // 手动/自动/智能选择等包含全部节点的组里。
+  '关闭其他节点组': false,
   '禁用内核QUIC流量': true,
   '优先国内DNS加速': true,
   '优先连接IPv6节点': false,
@@ -932,6 +935,7 @@ function createSubscriptionGroups(proxies) {
  */
 function buildRegionGroups(filteredProxies) {
   const generateRateGroupEnabled = ruleOptionsEnable.生成高低倍率组;
+  const disableOtherGroupEnabled = ruleOptionsEnable.关闭其他节点组;
 
   const regionGroups = Object.fromEntries(allRegionDefinitions.map(({ name }) => [name, []]));
   const otherProxies = [];
@@ -953,7 +957,7 @@ function buildRegionGroups(filteredProxies) {
     .filter((r) => regionGroups[r.name].length > 0 && (generateRateGroupEnabled || !rateRegionDefinitions.includes(r)))
     .flatMap((r) => createRegionGroup(r.name, r.icon, regionGroups[r.name]));
 
-  if (otherProxies.length > 0) {
+  if (otherProxies.length > 0 && !disableOtherGroupEnabled) {
     generatedRegionGroups.push(...createRegionGroup('其他节点', `${iconBaseUrl}common/WorldMap.svg`, otherProxies));
   }
 
