@@ -212,8 +212,9 @@ type smartSiteRecord struct {
 }
 
 // smartRankCache is a short-lived, read-only score ranking shared by the
-// connections of one group. Site memory is not part of it: that is
-// per-destination and applied by the caller from the current site record.
+// connections of one group. Site memory is not part of it: the caller applies
+// it from the current record, per destination for a general group and once
+// for the whole service group.
 type smartRankCache struct {
 	proxies []C.Proxy
 	builtAt time.Time
@@ -236,8 +237,9 @@ type Smart struct {
 	rankGen   uint64
 
 	// service is empty unless the group ranks members by their ability to
-	// reach one service; verdicts holds the last decidable probe result per
-	// member, attempts the last probe try, decidable or not.
+	// reach one service and fixes on one member for everything it routes;
+	// verdicts holds the last decidable probe result per member, attempts the
+	// last probe try, decidable or not.
 	service   string
 	verdicts  map[string]serviceVerdict
 	attempts  map[string]serviceProbeAttempt
@@ -245,23 +247,32 @@ type Smart struct {
 	probing   bool
 }
 
-// Now implements ProxyGroup: the pinned policy, else the most-used policy in
-// the recent period, else the best-scored one. Like Surge, the reported
-// selection is not necessarily the policy every new connection will use.
+// Now implements ProxyGroup: the pinned policy, else the member a service
+// group fixes on, else the most-used policy in the recent period, else the
+// best-scored one. Like Surge, the reported selection is not necessarily the
+// policy every new connection will use.
 func (s *Smart) Now() string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	proxies := s.GetProxies(false)
-	if s.selected != "" {
+
+	if selected := s.fixedName(); selected != "" {
 		for _, proxy := range proxies {
-			if proxy.Name() == s.selected {
-				return s.selected
+			if proxy.Name() == selected {
+				return selected
 			}
 		}
 	}
 
+	// A service group fixes on one member for everything, so the panel must
+	// name that member, not the best-scored or most-used one.
+	if s.service != "" {
+		if item := s.servicePick(proxies, time.Now()); item != nil {
+			return item.proxy.Name()
+		}
+	}
+
 	now := time.Now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	bestName := ""
 	bestUsage := 0.0
 	bestScoreName := ""
@@ -300,6 +311,31 @@ func (s *Smart) Now() string {
 		return bestScoreName
 	}
 	return blockedScoreName
+}
+
+// servicePick returns the member a service group fixes on next: the newest
+// success still inside the preferred band, else the best band member at cold
+// start. It shares preferredBandPick with the connection path so the panel,
+// Unwrap and the routing agree on one member.
+func (s *Smart) servicePick(proxies []C.Proxy, now time.Time) *smartCandidate {
+	ranked := s.rankedCandidates(proxies, now)
+	if len(ranked) == 0 {
+		return nil
+	}
+	s.mu.Lock()
+	var entries map[string]smartSiteEntry
+	if record := s.sites[s.service]; record != nil {
+		entries = make(map[string]smartSiteEntry, len(record.proxies))
+		for name, entry := range record.proxies {
+			entries[name] = *entry
+		}
+	}
+	s.mu.Unlock()
+	pick, ok := preferredBandPick(ranked, entries, now, true)
+	if !ok {
+		return nil
+	}
+	return &ranked[pick]
 }
 
 // smartNodeFailure reports whether a first-write error is evidence against the
@@ -482,16 +518,18 @@ func (s *Smart) Unwrap(metadata *C.Metadata, touch bool) C.Proxy {
 }
 
 // representativeProxy returns the deterministic policy that stands for the
-// group: the pinned policy when it is still a member, otherwise the
-// best-scored alive policy, otherwise the best-scored policy. Capability
-// queries and Unwrap use it so the answer never depends on a random pick.
+// group: the pinned policy when it is still a member, otherwise for a service
+// group the member it fixes on, otherwise the best-scored alive policy,
+// otherwise the best-scored policy. Capability queries and Unwrap use it so
+// the answer never depends on a random pick.
 func (s *Smart) representativeProxy(metadata *C.Metadata, touch bool) C.Proxy {
 	proxies := s.GetProxies(touch)
 	if len(proxies) == 0 {
 		return nil
 	}
 
-	ranked := s.rankedCandidates(proxies, time.Now())
+	now := time.Now()
+	ranked := s.rankedCandidates(proxies, now)
 	if len(ranked) == 0 {
 		return nil
 	}
@@ -505,6 +543,13 @@ func (s *Smart) representativeProxy(metadata *C.Metadata, touch bool) C.Proxy {
 			if item.proxy.Name() == pinned {
 				return item.proxy
 			}
+		}
+	}
+	// A service group stands for the member it fixes on, so capability
+	// questions are answered by the machine the traffic actually uses.
+	if s.service != "" {
+		if item := s.servicePick(proxies, now); item != nil {
+			return item.proxy
 		}
 	}
 	for _, item := range ranked {
@@ -618,10 +663,10 @@ func siteStatus(entries map[string]smartSiteEntry, name string, now time.Time) (
 	return hit, miss
 }
 
-// stickySitePick returns the preferred member that most recently served the
-// site. The pick is self-reinforcing: while the member keeps answering, its
-// success stays the newest, and it drops out as soon as it fails, falls out of
-// the preferred band, or the service probe demotes it.
+// stickySitePick returns the preferred member with the newest success in the
+// group's memory record. The pick is self-reinforcing: while the member keeps
+// answering, its success stays the newest, and it drops out as soon as it
+// fails, falls out of the preferred band, or the service probe demotes it.
 func stickySitePick(ranked []smartCandidate, preferred []int, entries map[string]smartSiteEntry, now time.Time) (int, bool) {
 	sticky := -1
 	var newest time.Time
@@ -635,6 +680,61 @@ func stickySitePick(ranked []smartCandidate, preferred []int, entries map[string
 		}
 	}
 	return sticky, sticky >= 0
+}
+
+// preferredBandPick returns the first choice among the policies inside the
+// preferred band around the best usable score. Service groups pin to the band
+// member with the newest success -- Google and OpenAI tie sessions to the
+// egress IP, so one member serves the whole service -- and, until a success is
+// remembered, fix on the best band member so the first burst of connections
+// concentrates on one machine instead of spreading across the band. General
+// groups keep the in-band rotation: spreading load is the point there.
+func preferredBandPick(ranked []smartCandidate, entries map[string]smartSiteEntry, now time.Time, service bool) (int, bool) {
+	best := 0.0
+	hasBest := false
+	for _, item := range ranked {
+		if !item.alive || item.blocked {
+			continue
+		}
+		if _, miss := siteStatus(entries, item.proxy.Name(), now); miss {
+			continue
+		}
+		best = item.score
+		hasBest = true
+		break
+	}
+	if !hasBest {
+		return -1, false
+	}
+
+	baseGap := math.Max(best*smartPreferredGapRatio, smartPreferredGapMin)
+	var preferred []int
+	for i, item := range ranked {
+		if !item.alive || item.blocked {
+			continue
+		}
+		hit, miss := siteStatus(entries, item.proxy.Name(), now)
+		if miss {
+			continue
+		}
+		gap := baseGap
+		if hit {
+			gap = math.Max(best*smartSitePreferredGap, smartPreferredGapMin)
+		}
+		if item.score <= best+gap {
+			preferred = append(preferred, i)
+		}
+	}
+	if len(preferred) == 0 {
+		return -1, false
+	}
+	if service {
+		if sticky, ok := stickySitePick(ranked, preferred, entries, now); ok {
+			return sticky, true
+		}
+		return preferred[0], true
+	}
+	return preferred[rand.Intn(len(preferred))], true
 }
 
 // sameProxyList reports whether both slices share a backing array. GroupBase
@@ -714,7 +814,9 @@ func (s *Smart) orderedCandidates(metadata *C.Metadata, touch bool) []C.Proxy {
 	if len(ranked) == 0 {
 		return nil
 	}
-	siteKey := getKey(metadata)
+	// Service groups share one memory record, so the pin formed on any
+	// destination carries the whole group.
+	siteKey := s.memoryKey(metadata)
 
 	s.mu.Lock()
 	var siteEntries map[string]smartSiteEntry
@@ -740,54 +842,8 @@ func (s *Smart) orderedCandidates(metadata *C.Metadata, touch bool) []C.Proxy {
 	}
 
 	if firstPick < 0 {
-		best := 0.0
-		hasBest := false
-		for _, item := range ranked {
-			if !item.alive || item.blocked {
-				continue
-			}
-			if _, miss := siteStatus(siteEntries, item.proxy.Name(), now); miss {
-				continue
-			}
-			best = item.score
-			hasBest = true
-			break
-		}
-
-		var preferred []int
-		if hasBest {
-			baseGap := math.Max(best*smartPreferredGapRatio, smartPreferredGapMin)
-			for i, item := range ranked {
-				if !item.alive || item.blocked {
-					continue
-				}
-				hit, miss := siteStatus(siteEntries, item.proxy.Name(), now)
-				if miss {
-					continue
-				}
-				gap := baseGap
-				if hit {
-					gap = math.Max(best*smartSitePreferredGap, smartPreferredGapMin)
-				}
-				if item.score <= best+gap {
-					preferred = append(preferred, i)
-				}
-			}
-		}
-
-		if len(preferred) > 0 {
-			// Service groups pin the destination to the member that most recently
-			// served it: Google and OpenAI tie sessions to the egress IP, so
-			// rotating inside the preferred set costs more than the load it
-			// spreads. General groups keep the rotation.
-			if s.service != "" {
-				if sticky, ok := stickySitePick(ranked, preferred, siteEntries, now); ok {
-					firstPick = sticky
-				}
-			}
-			if firstPick < 0 {
-				firstPick = preferred[rand.Intn(len(preferred))]
-			}
+		if pick, ok := preferredBandPick(ranked, siteEntries, now, s.service != ""); ok {
+			firstPick = pick
 		} else {
 			// nothing preferred: still try a live policy before a dead one, even
 			// if every live policy is suspended for this site.
@@ -930,10 +986,20 @@ func (s *Smart) reportUsed(name string) {
 	s.mu.Unlock()
 }
 
-// rememberSite records the per-site outcome that drives the group's site
-// memory; the caller must hold s.mu.
+// memoryKey is the key a connection's outcome records under. A general group
+// remembers per destination site; a service group keeps one record, so the
+// member that served any domain of the service is pinned for them all.
+func (s *Smart) memoryKey(metadata *C.Metadata) string {
+	if s.service != "" {
+		return s.service
+	}
+	return getKey(metadata)
+}
+
+// rememberSite records the outcome that drives the group's site memory; the
+// caller must hold s.mu.
 func (s *Smart) rememberSite(metadata *C.Metadata, name string, success bool, now time.Time) {
-	key := getKey(metadata)
+	key := s.memoryKey(metadata)
 	if key == "" || name == "" {
 		return
 	}

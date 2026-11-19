@@ -502,6 +502,108 @@ func TestSmartStickyMemberSkipsServiceBlockedAndSiteMiss(t *testing.T) {
 	})
 }
 
+func TestSmartServiceGroupPinsAcrossDestinations(t *testing.T) {
+	best := newFakeProxy("Best", 100)
+	recent := newFakeProxy("Recent", 130) // inside the widened hit band
+	s := newTestSmartWithProxies(best, recent)
+	s.service = "youtube"
+	now := time.Now()
+	// One answered request anywhere in the group must fix the member for
+	// every destination the service spans.
+	s.rememberSite(&C.Metadata{Host: "www.youtube.com"}, "Recent", true, now.Add(-time.Minute))
+	s.lastProbe = now
+
+	for _, host := range []string{
+		"www.youtube.com",
+		"rr3---sn-abc.googlevideo.com",
+		"i.ytimg.com",
+		"api.youtube.com",
+	} {
+		order := s.orderedCandidates(&C.Metadata{Host: host}, false)
+		if len(order) != 2 || order[0].Name() != "Recent" {
+			t.Fatalf("host %s must ride the pinned member, got %v", host, names(order))
+		}
+	}
+}
+
+func TestSmartServiceGroupColdStartFixesBestMember(t *testing.T) {
+	best := newFakeProxy("Best", 100)
+	closeScore := newFakeProxy("Close", 110) // inside the band
+	s := newTestSmartWithProxies(best, closeScore)
+	s.service = "openai"
+	s.lastProbe = time.Now()
+
+	// No success remembered yet: every connection of the first burst must land
+	// on the same member, so the pin forms on the first response instead of
+	// spreading across the band.
+	for i := 0; i < 32; i++ {
+		order := s.orderedCandidates(&C.Metadata{Host: "chatgpt.com"}, false)
+		if len(order) != 2 || order[0].Name() != "Best" {
+			t.Fatalf("cold start must fix on the best member, got %v on call %d", names(order), i)
+		}
+	}
+}
+
+func TestSmartServiceGroupFailureMigratesThePin(t *testing.T) {
+	best := newFakeProxy("Best", 100)
+	recent := newFakeProxy("Recent", 130)
+	s := newTestSmartWithProxies(best, recent)
+	s.service = "youtube"
+	now := time.Now()
+	s.rememberSite(&C.Metadata{Host: "www.youtube.com"}, "Recent", true, now.Add(-2*time.Minute))
+	// The pinned member failed; the fallback answered and re-pinned the group.
+	s.rememberSite(&C.Metadata{Host: "i.ytimg.com"}, "Recent", false, now.Add(-time.Minute))
+	s.rememberSite(&C.Metadata{Host: "rr3.example.googlevideo.com"}, "Best", true, now)
+	s.lastProbe = now
+
+	for _, host := range []string{"www.youtube.com", "i.ytimg.com", "api.youtube.com"} {
+		if order := s.orderedCandidates(&C.Metadata{Host: host}, false); order[0].Name() != "Best" {
+			t.Fatalf("host %s must ride the new pin, got %v", host, names(order))
+		}
+	}
+}
+
+func TestSmartNowReportsServiceGroupPin(t *testing.T) {
+	best := newFakeProxy("Best", 100)
+	recent := newFakeProxy("Recent", 130)
+	s := newTestSmartWithProxies(best, recent)
+	s.service = "openai"
+	now := time.Now()
+
+	// Cold start: the panel names the member the next request will fix on.
+	if got := s.Now(); got != "Best" {
+		t.Fatalf("cold start Now() = %q, want Best", got)
+	}
+
+	// The pin moved to a slower member without accumulated usage: the panel
+	// follows the pin, not the score or the usage.
+	s.rememberSite(&C.Metadata{Host: "chatgpt.com"}, "Recent", true, now)
+	s.reportUsed("Best")
+	s.reportUsed("Best")
+	if got := s.Now(); got != "Recent" {
+		t.Fatalf("pinned Now() = %q, want Recent", got)
+	}
+
+	// A manual pin still outranks the group pin.
+	s.ForceSet("Best")
+	if got := s.Now(); got != "Best" {
+		t.Fatalf("manual pin Now() = %q, want Best", got)
+	}
+}
+
+func TestSmartUnwrapFollowsServicePin(t *testing.T) {
+	best := newFakeProxy("Best", 100)
+	recent := newFakeProxy("Recent", 130)
+	s := newTestSmartWithProxies(best, recent)
+	s.service = "openai"
+	now := time.Now()
+	s.rememberSite(&C.Metadata{Host: "chatgpt.com"}, "Recent", true, now)
+
+	if proxy := s.Unwrap(nil, false); proxy == nil || proxy.Name() != "Recent" {
+		t.Fatalf("Unwrap must stand for the pinned member, got %v", proxy)
+	}
+}
+
 func TestSmartGeneralGroupKeepsRotation(t *testing.T) {
 	a := newFakeProxy("A", 100)
 	b := newFakeProxy("B", 110)

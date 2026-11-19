@@ -623,6 +623,51 @@ func TestSmartSiteFailureTTL(t *testing.T) {
 	})
 }
 
+func TestSmartNowReportsMostUsedThenBestScore(t *testing.T) {
+	a := newFakeProxy("A", 100)
+	b := newFakeProxy("B", 200)
+	s := newTestSmartWithProxies(a, b)
+
+	if got := s.Now(); got != "A" {
+		t.Fatalf("without usage the best score must show, Now() = %q", got)
+	}
+	s.reportUsed("B")
+	if got := s.Now(); got != "B" {
+		t.Fatalf("recent usage must outrank the score, Now() = %q", got)
+	}
+	s.ForceSet("A")
+	if got := s.Now(); got != "A" {
+		t.Fatalf("the manual pin must outrank usage, Now() = %q", got)
+	}
+}
+
+func TestSmartGeneralGroupKeepsPerSiteMemory(t *testing.T) {
+	best := newFakeProxy("Best", 100)
+	slower := newFakeProxy("Slower", 130)      // outside the plain band, inside the hit band
+	s := newTestSmartWithProxies(best, slower) // general group: no service
+	now := time.Now()
+	s.rememberSite(&C.Metadata{Host: "hit.example.com"}, "Slower", true, now)
+
+	// On the site it served, the widened hit band keeps Slower preferred, so
+	// the rotation reaches it.
+	seen := make(map[string]bool, 2)
+	for i := 0; i < 100; i++ {
+		order := s.orderedCandidates(&C.Metadata{Host: "hit.example.com"}, false)
+		seen[order[0].Name()] = true
+	}
+	if !seen["Best"] || !seen["Slower"] {
+		t.Fatalf("the rotation must reach both band members on the served site, saw %v", seen)
+	}
+
+	// Another site never served by Slower keeps the plain band, so the slower
+	// member is never the first pick there.
+	for i := 0; i < 100; i++ {
+		if order := s.orderedCandidates(&C.Metadata{Host: "cold.example.org"}, false); order[0].Name() != "Best" {
+			t.Fatalf("an unserved site must not inherit the hit band, got %s", order[0].Name())
+		}
+	}
+}
+
 func TestSmartSiteMemoryEvictsOldestRecord(t *testing.T) {
 	s := newTestSmart()
 	base := time.Now()
