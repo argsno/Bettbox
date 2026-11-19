@@ -17,6 +17,11 @@ const _largeRuleSetCount = 10000;
 // missing key (older script) keeps the row hidden.
 const _otherGroupOptionKey = '其他节点';
 
+// Same trick for the node-matched streaming group: the row only appears when
+// the script declares the option, and the group is only generated when the
+// airport actually has streaming-tagged nodes.
+const _streamingGroupOptionKey = '流媒体';
+
 final _searchKeyPattern = RegExp(r'[^\p{L}\p{N}]', unicode: true);
 
 Future<void> showManagedOptions(BuildContext context) async {
@@ -337,7 +342,9 @@ class _ManagedOptionsSheetState extends ConsumerState<ManagedOptionsSheet> {
       _groupNames = policyGroupOptions;
       _others = [
         for (final key in options.keys)
-          if (!policyGroupOptions.contains(key) && key != _otherGroupOptionKey)
+          if (!policyGroupOptions.contains(key) &&
+              key != _otherGroupOptionKey &&
+              key != _streamingGroupOptionKey)
             key,
       ];
       _options = options;
@@ -521,7 +528,8 @@ class _ManagedOptionsSheetState extends ConsumerState<ManagedOptionsSheet> {
         icons: _regionIcons,
         enabled: _regions,
         otherGroupOption: _options[_otherGroupOptionKey],
-        onSave: (enabled, customRegions, otherGroupOption) {
+        streamingGroupOption: _options[_streamingGroupOptionKey],
+        onSave: (enabled, customRegions, otherGroupOption, streamingGroupOption) {
           if (!mounted) return;
           setState(() {
             _enabledRegions = enabled;
@@ -529,6 +537,9 @@ class _ManagedOptionsSheetState extends ConsumerState<ManagedOptionsSheet> {
             _customRegions = customRegions;
             if (otherGroupOption != null) {
               _options[_otherGroupOptionKey] = otherGroupOption;
+            }
+            if (streamingGroupOption != null) {
+              _options[_streamingGroupOptionKey] = streamingGroupOption;
             }
             _regionIcons = {
               for (final region in catalog.regions)
@@ -896,10 +907,12 @@ class _RegionsSheet extends StatefulWidget {
   // Null when the script does not declare the option: the row stays hidden
   // so an older script never shows a dead switch.
   final bool? otherGroupOption;
+  final bool? streamingGroupOption;
   final void Function(
     List<String> enabled,
     List<CustomRegion> customRegions,
     bool? otherGroupOption,
+    bool? streamingGroupOption,
   ) onSave;
 
   const _RegionsSheet({
@@ -909,6 +922,7 @@ class _RegionsSheet extends StatefulWidget {
     required this.icons,
     required this.enabled,
     this.otherGroupOption,
+    this.streamingGroupOption,
     required this.onSave,
   });
 
@@ -920,6 +934,7 @@ class _RegionsSheetState extends State<_RegionsSheet> {
   late final Set<String> _enabled = widget.enabled.toSet();
   late final List<CustomRegion> _customRegions = List.of(widget.customRegions);
   late bool? _otherGroupOption = widget.otherGroupOption;
+  late bool? _streamingGroupOption = widget.streamingGroupOption;
   bool _dirty = false;
 
   Future<void> _handleSave() async {
@@ -927,10 +942,12 @@ class _RegionsSheetState extends State<_RegionsSheet> {
       for (final region in widget.regions) region.name,
       for (final region in _customRegions) region.name,
     ];
-    widget.onSave([
-      for (final name in allNames)
-        if (_enabled.contains(name)) name,
-    ], _customRegions, _otherGroupOption);
+    widget.onSave(
+      [for (final name in allNames) if (_enabled.contains(name)) name],
+      _customRegions,
+      _otherGroupOption,
+      _streamingGroupOption,
+    );
     _dirty = false;
     if (mounted) Navigator.of(context).pop();
   }
@@ -948,6 +965,10 @@ class _RegionsSheetState extends State<_RegionsSheet> {
       for (final r in widget.regions) r.name,
       for (final cr in _customRegions)
         if (cr != region) cr.name,
+      // A custom region sharing a generated group's name would emit two
+      // same-named proxy groups and break the whole config.
+      _otherGroupOptionKey,
+      _streamingGroupOptionKey,
     };
     final res = await globalState.showCommonDialog<CustomRegion>(
       child: _CustomRegionDialog(
@@ -989,10 +1010,53 @@ class _RegionsSheetState extends State<_RegionsSheet> {
     return null;
   }
 
+  Widget _optionRow({
+    required String name,
+    required String icon,
+    required bool value,
+    required ValueChanged<bool> onChanged,
+  }) => Padding(
+    padding: const EdgeInsets.symmetric(vertical: 4),
+    child: CommonCard(
+      type: CommonCardType.filled,
+      child: ListTile(
+        contentPadding: const EdgeInsets.symmetric(horizontal: 16),
+        leading: _RouteIcon(url: routeIconUrl(icon)),
+        title: Text(name),
+        trailing: Switch(value: value, onChanged: onChanged),
+      ),
+    ),
+  );
+
   @override
   Widget build(BuildContext context) {
     final regions = widget.regions;
     final otherOptionVisible = _otherGroupOption != null;
+    final streamingOptionVisible = _streamingGroupOption != null;
+    // Node-matched option rows come after the regions, mirroring the order the
+    // script generates the groups in: regions, streaming, other nodes.
+    final optionRows = [
+      if (streamingOptionVisible)
+        _optionRow(
+          name: _streamingGroupOptionKey,
+          icon: 'Streaming.svg',
+          value: _streamingGroupOption!,
+          onChanged: (value) => setState(() {
+            _streamingGroupOption = value;
+            _dirty = true;
+          }),
+        ),
+      if (otherOptionVisible)
+        _optionRow(
+          name: _otherGroupOptionKey,
+          icon: 'WorldMap.svg',
+          value: _otherGroupOption!,
+          onChanged: (value) => setState(() {
+            _otherGroupOption = value;
+            _dirty = true;
+          }),
+        ),
+    ];
     return CommonPopScope(
       onPop: _confirmDiscard,
       child: AdaptiveSheetScaffold(
@@ -1013,9 +1077,8 @@ class _RegionsSheetState extends State<_RegionsSheet> {
         ],
         body: ListView.builder(
           padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-          itemCount: regions.length +
-              _customRegions.length +
-              (otherOptionVisible ? 1 : 0),
+          itemCount:
+              regions.length + _customRegions.length + optionRows.length,
           itemBuilder: (context, index) {
             if (index < regions.length) {
               final region = regions[index];
@@ -1042,68 +1105,51 @@ class _RegionsSheetState extends State<_RegionsSheet> {
                 ),
               );
             }
-            if (otherOptionVisible &&
-                index == regions.length + _customRegions.length) {
+            final customCount = _customRegions.length;
+            if (index < regions.length + customCount) {
+              final customIndex = index - regions.length;
+              final customRegion = _customRegions[customIndex];
               return Padding(
                 padding: const EdgeInsets.symmetric(vertical: 4),
                 child: CommonCard(
                   type: CommonCardType.filled,
                   child: ListTile(
                     contentPadding: const EdgeInsets.symmetric(horizontal: 16),
-                    leading: _RouteIcon(url: routeIconUrl('WorldMap.svg')),
-                    title: const Text(_otherGroupOptionKey),
-                    trailing: Switch(
-                      value: _otherGroupOption!,
-                      onChanged: (value) => setState(() {
-                        _otherGroupOption = value;
-                        _dirty = true;
-                      }),
+                    leading: _RouteIcon(url: _customIconUrl(customRegion.name)),
+                    title: Text(customRegion.name),
+                    subtitle: Text(
+                      customRegion.regex,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: context.textTheme.bodySmall?.toLight,
                     ),
+                    trailing: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        IconButton(
+                          icon: const Icon(Icons.delete_outline),
+                          onPressed: () => _handleDeleteCustomRegion(customIndex),
+                        ),
+                        Switch(
+                          value: _enabled.contains(customRegion.name),
+                          onChanged: (value) => setState(() {
+                            if (value) {
+                              _enabled.add(customRegion.name);
+                            } else {
+                              _enabled.remove(customRegion.name);
+                            }
+                            _dirty = true;
+                          }),
+                        ),
+                      ],
+                    ),
+                    onTap: () =>
+                        _handleAddOrEditCustomRegion(customRegion, customIndex),
                   ),
                 ),
               );
             }
-            final customIndex = index - regions.length;
-            final customRegion = _customRegions[customIndex];
-            return Padding(
-              padding: const EdgeInsets.symmetric(vertical: 4),
-              child: CommonCard(
-                type: CommonCardType.filled,
-                child: ListTile(
-                  contentPadding: const EdgeInsets.symmetric(horizontal: 16),
-                  leading: _RouteIcon(url: _customIconUrl(customRegion.name)),
-                  title: Text(customRegion.name),
-                  subtitle: Text(
-                    customRegion.regex,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: context.textTheme.bodySmall?.toLight,
-                  ),
-                  trailing: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      IconButton(
-                        icon: const Icon(Icons.delete_outline),
-                        onPressed: () => _handleDeleteCustomRegion(customIndex),
-                      ),
-                      Switch(
-                        value: _enabled.contains(customRegion.name),
-                        onChanged: (value) => setState(() {
-                          if (value) {
-                            _enabled.add(customRegion.name);
-                          } else {
-                            _enabled.remove(customRegion.name);
-                          }
-                          _dirty = true;
-                        }),
-                      ),
-                    ],
-                  ),
-                  onTap: () =>
-                      _handleAddOrEditCustomRegion(customRegion, customIndex),
-                ),
-              ),
-            );
+            return optionRows[index - regions.length - customCount];
           },
         ),
       ),

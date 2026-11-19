@@ -213,6 +213,116 @@ void main() {
     expect(group(config, '手动选择')['proxies'], contains('Mystery 01'));
   });
 
+  final netflixProxy = {
+    'name': 'HK Netflix 解锁 01',
+    'type': 'ss',
+    'server': 'hk-nf.example.com',
+    'port': 443,
+    'cipher': 'aes-128-gcm',
+    'password': 'pw',
+  };
+
+  final streamingProxy = {
+    'name': 'Mystery Streaming 01',
+    'type': 'ss',
+    'server': 'mystery-stream.example.com',
+    'port': 443,
+    'cipher': 'aes-128-gcm',
+    'password': 'pw',
+  };
+
+  test('streaming-tagged nodes form the streaming group by default', () async {
+    final config = await generate({}, proxies: [
+      {
+        'name': 'HK 01',
+        'type': 'ss',
+        'server': 'hk.example.com',
+        'port': 443,
+        'cipher': 'aes-128-gcm',
+        'password': 'pw',
+      },
+      netflixProxy,
+      streamingProxy,
+    ]);
+    expect(groupTypes(config), contains('流媒体:select'));
+    // 地区命中与流媒体命中不互斥：Netflix 节点同时进入香港组。
+    expect(group(config, '流媒体')['proxies'], [
+      '🇭🇰 HK Netflix 解锁 01',
+      'Mystery Streaming 01',
+    ]);
+    expect(group(config, '香港')['proxies'], [
+      '🇭🇰 HK 01',
+      '🇭🇰 HK Netflix 解锁 01',
+    ]);
+    expect(
+      group(config, '默认代理')['proxies'],
+      containsAllInOrder(['香港', '流媒体', '其他节点']),
+    );
+    expect(group(config, 'AI')['proxies'], contains('流媒体'));
+    // 纯流媒体节点未命中任何地区，仍归入其他节点，与倍率组行为一致。
+    expect(group(config, '其他节点')['proxies'], ['Mystery Streaming 01']);
+  });
+
+  test('the streaming group switch removes the group but keeps its nodes', () async {
+    final config = await generate({'流媒体': false}, proxies: [
+      netflixProxy,
+      streamingProxy,
+    ]);
+    final names = [for (final g in groups(config)) g['name'] as String];
+    expect(names, isNot(contains('流媒体')));
+    expect(group(config, '默认代理')['proxies'], isNot(contains('流媒体')));
+    expect(group(config, 'AI')['proxies'], isNot(contains('流媒体')));
+    expect(group(config, '香港')['proxies'], ['🇭🇰 HK Netflix 解锁 01']);
+    expect(
+      group(config, '手动选择')['proxies'],
+      containsAll(['🇭🇰 HK Netflix 解锁 01', 'Mystery Streaming 01']),
+    );
+  });
+
+  test('streaming group follows the region auto/smart switches', () async {
+    final config = await generate({
+      '生成地区自动选择组': true,
+      '生成地区智能选择组': true,
+    }, proxies: [netflixProxy]);
+    final types = groupTypes(config);
+    expect(types, contains('流媒体-自动选择:url-test'));
+    expect(types, contains('流媒体-智能选择:smart'));
+    expect(group(config, '流媒体')['proxies'], [
+      '流媒体-自动选择',
+      '流媒体-智能选择',
+      '🇭🇰 HK Netflix 解锁 01',
+    ]);
+  });
+
+  test('a same-named custom region wins over the built-in streaming group', () async {
+    final config = await generate(
+      {},
+      prelude:
+          "const bettboxRegions = ['流媒体'];"
+          "const bettboxCustomRegions = [{'name':'流媒体','regex':'自定义流媒体'}];",
+      proxies: [
+        {
+          'name': '自定义流媒体 01',
+          'type': 'ss',
+          'server': 'custom.example.com',
+          'port': 443,
+          'cipher': 'aes-128-gcm',
+          'password': 'pw',
+        },
+        netflixProxy,
+      ],
+    );
+    final names = [for (final g in groups(config)) g['name'] as String];
+    expect(
+      names.toSet().length,
+      names.length,
+      reason: 'duplicate proxy group names: $names',
+    );
+    expect(names.where((name) => name == '流媒体').length, 1);
+    // 自定义地区的正则胜出：Netflix 节点不再被拉进流媒体组。
+    expect(group(config, '流媒体')['proxies'], ['自定义流媒体 01']);
+  });
+
   test('minimal mode adds smart select too', () async {
     final config = await generate({
       '自动选择': true,

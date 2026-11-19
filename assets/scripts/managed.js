@@ -4,7 +4,7 @@
  * 自定义分流远程规则集：@appshubcc https://github.com/appshubcc/bett-rules 
  */
 
-// @version 2026111907
+// @version 2026111910
 const Compatible_With_Bettbox = { ruleOptionsEnable: true };
 
 const ruleOptionsEnable = {
@@ -51,6 +51,9 @@ const ruleOptionsEnable = {
   // 为未命中任何启用地区的节点生成「其他节点」组，与地区开关同极性；关闭后
   // 这些节点仍保留在手动/自动/智能选择等包含全部节点的组里。
   '其他节点': true,
+  // 为节点名命中流媒体关键词（streamingRegionRegex：流媒体/解锁/Netflix/Disney 等）
+  // 的节点生成「流媒体」组；无命中时不生成，命中地区的节点仍同时归入对应地区组。
+  '流媒体': true,
   '禁用内核QUIC流量': true,
   '优先国内DNS加速': true,
   '优先连接IPv6节点': false,
@@ -186,7 +189,27 @@ const rateRegionDefinitions = [
   },
 ];
 
-const allRegionDefinitions = [...activeRegionDefinitions, ...rateRegionDefinitions];
+// 「流媒体」组与地区组同构：按节点名匹配而非按分流规则，命中的节点归入该组，
+// 与地区组不互斥（如「香港 Netflix 解锁」同时进入「香港」与「流媒体」）。
+// 匹配词只收机场标注流媒体/解锁节点的高频词，避免泛化误伤普通节点名。
+const streamingRegionName = '流媒体';
+const streamingRegionRegex =
+  /流媒体|流媒|全解|解锁|奈飞|迪士尼|油管|巴哈|声破天|netflix|disney|youtube|spotify|hulu|paramount|prime\s*video|(?<![A-Za-z])stream|(?<![A-Za-z])media(?![A-Za-z])|(?<![A-Za-z])NF(?![A-Za-z])|(?<![A-Za-z])BBC(?![A-Za-z])|(?<![A-Za-z])TVB(?![A-Za-z])|(?<![A-Za-z])HBO(?![A-Za-z])|(?<![A-Za-z])DAZN(?![A-Za-z])|(?<![A-Za-z])DMM(?![A-Za-z])|(?<![A-Za-z])abema|(?<![A-Za-z])bahamut|(?<![A-Za-z])emby|(?<![A-Za-z])plex|(?<![A-Za-z])tiktok/i;
+
+const streamingRegionDefinition = {
+  name: streamingRegionName,
+  regex: streamingRegionRegex,
+  icon: `${iconBaseUrl}common/Streaming.svg`,
+};
+
+// 自定义地区可能与倍率/流媒体组重名（老配置里已存下同名自定义地区），重名会让
+// Object.fromEntries 折叠分组桶后再生成两份同名组，内核无法加载；重名时让先
+// 定义的自定义地区胜出，内置定义被忽略。
+const allRegionDefinitions = [
+  ...activeRegionDefinitions,
+  ...rateRegionDefinitions,
+  streamingRegionDefinition,
+].filter((region, index, list) => list.findIndex((item) => item.name === region.name) === index);
 
 const ruleProviderCommonDomain = {
   type: 'http',
@@ -935,10 +958,11 @@ function createSubscriptionGroups(proxies) {
 }
 
 /**
- * 将节点按地区/倍率归类，构建地区策略组、倍率策略组与「其他节点」组
+ * 将节点按地区/倍率/流媒体归类，构建地区策略组、倍率策略组、「流媒体」组与「其他节点」组
  */
 function buildRegionGroups(filteredProxies) {
   const generateRateGroupEnabled = ruleOptionsEnable.生成高低倍率组;
+  const generateStreamingGroupEnabled = ruleOptionsEnable[streamingRegionName];
   const otherGroupEnabled = ruleOptionsEnable.其他节点;
 
   const regionGroups = Object.fromEntries(allRegionDefinitions.map(({ name }) => [name, []]));
@@ -958,7 +982,13 @@ function buildRegionGroups(filteredProxies) {
   }
 
   const generatedRegionGroups = sortByGroupOrder(allRegionDefinitions)
-    .filter((r) => regionGroups[r.name].length > 0 && (generateRateGroupEnabled || !rateRegionDefinitions.includes(r)))
+    .filter(
+      (r) =>
+        regionGroups[r.name].length > 0 &&
+        (r.name === streamingRegionName
+          ? generateStreamingGroupEnabled
+          : generateRateGroupEnabled || !rateRegionDefinitions.includes(r)),
+    )
     .flatMap((r) => createRegionGroup(r.name, r.icon, regionGroups[r.name]));
 
   if (otherProxies.length > 0 && otherGroupEnabled) {
