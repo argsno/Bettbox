@@ -7,6 +7,7 @@
 #   scripts/build-lite-release.sh --skip-macos  # 只打 Android
 #   scripts/build-lite-release.sh --no-clean    # 保留 build/，跳过 flutter clean 与 Rust 预热
 #   scripts/build-lite-release.sh --check       # 只解析工具链并校验已有产物，不构建
+#   scripts/build-lite-release.sh --install     # 校验通过后把 .app 装进 /Applications
 #
 # 工具链可以用环境变量覆盖：FLUTTER_HOME、JAVA_HOME、ANDROID_NDK、ANDROID_SDK_ROOT。
 # 具体命令与踩坑记录见 docs/build-macos.md §3、§5。
@@ -23,6 +24,7 @@ DO_MACOS=1
 DO_ANDROID=1
 DO_CLEAN=1
 CHECK_ONLY=0
+DO_INSTALL=0
 
 log() { printf '==> %s\n' "$*"; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
@@ -36,6 +38,7 @@ usage() {
   --skip-android     只打 macOS
   --no-clean         保留 build/，跳过 flutter clean 与 Rust 预热
   --check            只校验 dist/ 里已有的产物，不构建
+  --install           把刚校验过的 .app 装进 /Applications；配 --check 可只装不构建
   -h, --help         显示本说明
 EOF
 }
@@ -58,6 +61,7 @@ while [ $# -gt 0 ]; do
     --skip-android) DO_ANDROID=0; shift ;;
     --no-clean) DO_CLEAN=0; shift ;;
     --check) CHECK_ONLY=1; shift ;;
+    --install) DO_INSTALL=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) die "未知参数 $1（--help 看用法）" ;;
   esac
@@ -69,6 +73,7 @@ case "$ENV_NAME" in
 esac
 
 [ "$DO_MACOS" = 1 ] || [ "$DO_ANDROID" = 1 ] || die "--skip-macos 与 --skip-android 不能同时给"
+[ "$DO_INSTALL" = 0 ] || [ "$DO_MACOS" = 1 ] || die "--install 依赖 macOS 产物，不能配 --skip-macos"
 
 # ---------------------------------------------------------------- 工具链解析
 
@@ -200,6 +205,40 @@ verify_macos() {
   cleanup_mount
 }
 
+# 把刚校验过的 dmg 里的 .app 装进 /Applications。运行中的实例先发 quit Apple event，
+# 装完如果之前在跑就重新拉起，尽量不打断使用状态。
+install_macos() {
+  local dmg="dist/$APP_NAME-$APP_VERSION-macos-arm64-lite.dmg"
+  local dest="/Applications/$APP_NAME.app"
+  local was_running=0 i
+  [ -f "$dmg" ] || die "缺少产物 $dmg"
+
+  if pgrep -x "$APP_NAME" >/dev/null 2>&1; then
+    was_running=1
+    log "Bettbox 正在运行，先请求退出"
+    osascript -e "quit app \"$APP_NAME\"" >/dev/null 2>&1 || true
+    i=0
+    while pgrep -x "$APP_NAME" >/dev/null 2>&1; do
+      i=$((i + 1))
+      [ "$i" -le 10 ] || die "Bettbox 10 秒内没退干净，手动退出后跑 scripts/build-lite-release.sh --check --install"
+      sleep 1
+    done
+  fi
+
+  MOUNT_POINT="$(mktemp -d)"
+  hdiutil attach -nobrowse -readonly -mountpoint "$MOUNT_POINT" "$dmg" >/dev/null 2>&1 ||
+    die "挂载 $dmg 失败"
+  rm -rf "$dest"
+  ditto "$MOUNT_POINT/$APP_NAME.app" "$dest" || die "装进 $dest 失败，dmg 仍在 dist/ 里可手动装"
+  cleanup_mount
+
+  log "已安装  $dest"
+  if [ "$was_running" = 1 ]; then
+    log "重新拉起 Bettbox"
+    open -a "$dest"
+  fi
+}
+
 # ---------------------------------------------------------------- 主流程
 
 APP_VERSION="$(sed -n 's/^version: *\([0-9][0-9.]*\)+.*/\1/p' pubspec.yaml | head -1)"
@@ -215,7 +254,10 @@ mkdir -p "$LOG_DIR"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 
 if [ "$CHECK_ONLY" = 1 ]; then
-  [ "$DO_MACOS" = 0 ] || verify_macos
+  if [ "$DO_MACOS" = 1 ]; then
+    verify_macos
+    if [ "$DO_INSTALL" = 1 ]; then install_macos; fi
+  fi
   [ "$DO_ANDROID" = 0 ] || verify_android
   exit 0
 fi
@@ -237,6 +279,7 @@ fi
 if [ "$DO_MACOS" = 1 ]; then
   build_platform macos 2>&1 | tee "$LOG_DIR/macos-$STAMP.log"
   verify_macos
+  if [ "$DO_INSTALL" = 1 ]; then install_macos; fi
 fi
 
 if [ "$DO_ANDROID" = 1 ]; then
