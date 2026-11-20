@@ -95,6 +95,13 @@ func TestEvaluateGeminiPage(t *testing.T) {
 		t.Fatalf("unavailable page must be blocked, got %+v", unavailable)
 	}
 
+	// The app's unlock panel already treats the /unavailable redirect as a
+	// refusal; the core ranks members by the same policy.
+	unavailablePath := evaluateServiceResponse(preset, 200, "https://gemini.google.com/unavailable", "<html>Gemini</html>")
+	if !unavailablePath.blocked {
+		t.Fatalf("the unavailable path must be blocked, got %+v", unavailablePath)
+	}
+
 	errorStatus := evaluateServiceResponse(preset, 503, "https://gemini.google.com/app", "")
 	if errorStatus.known || errorStatus.blocked {
 		t.Fatalf("a 5xx answer is undecidable, got %+v", errorStatus)
@@ -111,7 +118,35 @@ func TestEvaluateGeminiPage(t *testing.T) {
 	}
 }
 
+func TestServicePresetBodyLimits(t *testing.T) {
+	// The Gemini region payload sits past 800 KB of a ~1 MB page; reading only
+	// the default prefix silently leaves every verdict without a region.
+	if got := serviceBodyLimit(servicePresets["google-gemini"]); got <= int64(serviceProbeMaxBody) {
+		t.Fatalf("gemini probe must read past the default body cap, got %d", got)
+	}
+	if got := serviceBodyLimit(servicePresets["openai"]); got != int64(serviceProbeMaxBody) {
+		t.Fatalf("a preset without its own cap must use the default, got %d", got)
+	}
+}
+
+func TestServicePresetSkipBody(t *testing.T) {
+	// The YouTube body judgment is paused (see the preset comment): the probe
+	// must not pay for the ~1 MB page while the result cannot change.
+	if !servicePresets["youtube"].skipBody {
+		t.Fatal("youtube probe must skip the body while its body judgment is paused")
+	}
+	if servicePresets["google-gemini"].skipBody {
+		t.Fatal("gemini must read the body to extract the region")
+	}
+	if servicePresets["openai"].skipBody {
+		t.Fatal("the openai trace lives in the body")
+	}
+}
+
 func TestEvaluateYouTubePage(t *testing.T) {
+	// The preset's body judgment is paused (skipBody), but its rules stay in the
+	// preset for the restart; this test keeps them honest until they are wired
+	// back on.
 	preset := servicePresets["youtube"]
 
 	allowed := evaluateServiceResponse(preset, 200, "https://www.youtube.com/premium", `"INNERTUBE_CONTEXT_GL":"US"`)
@@ -168,14 +203,14 @@ func TestSmartServiceBlockedVerdict(t *testing.T) {
 	s.verdicts["a"] = serviceVerdict{at: time.Now(), known: true, blocked: true}
 
 	s.mu.Lock()
-	blocked := s.serviceBlockedLocked("a", time.Now())
+	blocked := s.serviceUnusableLocked("a", time.Now())
 	stale := func() bool {
 		s.verdicts["b"] = serviceVerdict{
 			at:      time.Now().Add(-serviceVerdictTTL - time.Minute),
 			known:   true,
 			blocked: true,
 		}
-		return s.serviceBlockedLocked("b", time.Now())
+		return s.serviceUnusableLocked("b", time.Now())
 	}()
 	s.mu.Unlock()
 
@@ -202,7 +237,7 @@ func TestSmartApplyProbeOutcomes(t *testing.T) {
 		// A failed request records the attempt without touching the verdict.
 		"b": {},
 	}, s.Proxies(), now)
-	blockedA := s.serviceBlockedLocked("a", now)
+	blockedA := s.serviceUnusableLocked("a", now)
 	attemptA := s.attempts["a"]
 	attemptB := s.attempts["b"]
 	s.mu.Unlock()
@@ -216,16 +251,21 @@ func TestSmartApplyProbeOutcomes(t *testing.T) {
 	if attemptA.misses != 1 || attemptB.misses != 1 {
 		t.Fatalf("an undecidable answer and a failed request must each count a miss, got %d and %d", attemptA.misses, attemptB.misses)
 	}
+	if attemptA.fails != 0 || attemptB.fails != 1 {
+		t.Fatalf("only the missing answer must count a transport failure, got %d and %d", attemptA.fails, attemptB.fails)
+	}
 
 	s.mu.Lock()
 	s.applyProbeOutcomesLocked(map[string]serviceProbeOutcome{
 		"a": {done: true, verdict: serviceVerdict{at: now, known: true}},
 		"b": {done: true, verdict: serviceVerdict{at: now, known: true, blocked: true}},
 	}, s.Proxies(), now)
-	clearedA := s.serviceBlockedLocked("a", now)
-	blockedB := s.serviceBlockedLocked("b", now)
+	clearedA := s.serviceUnusableLocked("a", now)
+	blockedB := s.serviceUnusableLocked("b", now)
 	missesA := s.attempts["a"].misses
 	missesB := s.attempts["b"].misses
+	failsA := s.attempts["a"].fails
+	failsB := s.attempts["b"].fails
 	s.mu.Unlock()
 	if clearedA {
 		t.Fatal("a known allowed verdict must lift the demotion")
@@ -235,6 +275,9 @@ func TestSmartApplyProbeOutcomes(t *testing.T) {
 	}
 	if missesA != 0 || missesB != 0 {
 		t.Fatalf("a decidable answer must reset the miss streak, got %d and %d", missesA, missesB)
+	}
+	if failsA != 0 || failsB != 0 {
+		t.Fatalf("an answered probe must reset the failure streak, got %d and %d", failsA, failsB)
 	}
 }
 
@@ -259,6 +302,79 @@ func TestSmartApplyProbeOutcomesPrunesGoneMembers(t *testing.T) {
 	}
 }
 
+func TestSmartServiceVerified(t *testing.T) {
+	s := newTestSmartWithProxies(newFakeProxy("a", 100))
+	s.service = "google-gemini"
+	now := time.Now()
+	s.verdicts["a"] = serviceVerdict{at: now, known: true}
+
+	s.mu.Lock()
+	verified := s.serviceVerifiedLocked("a", now)
+	s.attempts["a"] = serviceProbeAttempt{at: now, fails: 1, misses: 1}
+	afterFailure := s.serviceVerifiedLocked("a", now)
+	s.attempts["a"] = serviceProbeAttempt{at: now}
+	expired := s.serviceVerifiedLocked("a", now.Add(serviceVerdictTTL+time.Minute))
+	s.verdicts["a"] = serviceVerdict{at: now, known: true, blocked: true}
+	blocked := s.serviceVerifiedLocked("a", now)
+	s.verdicts["a"] = serviceVerdict{at: now}
+	unknown := s.serviceVerifiedLocked("a", now)
+	s.mu.Unlock()
+
+	if !verified {
+		t.Fatal("a fresh allowed verdict must confirm the member")
+	}
+	if afterFailure {
+		t.Fatal("a request without an answer must drop the confirmation")
+	}
+	if expired {
+		t.Fatal("a verdict older than the TTL must not confirm the member")
+	}
+	if blocked {
+		t.Fatal("a blocked verdict must never confirm the member")
+	}
+	if unknown {
+		t.Fatal("an undecidable verdict must not confirm the member")
+	}
+}
+
+func TestSmartRepeatedProbeFailuresDemote(t *testing.T) {
+	s := newTestSmartWithProxies(newFakeProxy("a", 100))
+	s.service = "google-gemini"
+	now := time.Now()
+	// The last real answer allowed the member, but it is old enough that the
+	// probes are the only current evidence.
+	s.verdicts["a"] = serviceVerdict{at: now.Add(-serviceVerdictTTL - time.Minute), known: true}
+
+	s.mu.Lock()
+	for i := 0; i < serviceProbeFailLimit; i++ {
+		s.applyProbeOutcomesLocked(map[string]serviceProbeOutcome{"a": {}}, s.Proxies(), now)
+	}
+	demoted := s.serviceUnusableLocked("a", now)
+	attempt := s.attempts["a"]
+	s.mu.Unlock()
+
+	if !demoted {
+		t.Fatalf("a member that never answers must not stay usable, attempt=%+v", attempt)
+	}
+	if attempt.fails != serviceProbeFailLimit {
+		t.Fatalf("expected %d consecutive failures, got %d", serviceProbeFailLimit, attempt.fails)
+	}
+
+	// A response, even an undecidable one, proves the egress reaches the
+	// service and clears the failure streak on the next run.
+	s.mu.Lock()
+	s.applyProbeOutcomesLocked(map[string]serviceProbeOutcome{"a": {done: true}}, s.Proxies(), now)
+	recovered := !s.serviceUnusableLocked("a", now)
+	fails := s.attempts["a"].fails
+	s.mu.Unlock()
+	if !recovered {
+		t.Fatal("an answered probe must lift the failure demotion")
+	}
+	if fails != 0 {
+		t.Fatalf("an answered probe must reset the failure streak, got %d", fails)
+	}
+}
+
 func TestSmartSelectServiceProbeMembers(t *testing.T) {
 	alive := newFakeProxy("Alive", 100)
 	slow := newFakeProxy("Slow", 300)
@@ -271,12 +387,13 @@ func TestSmartSelectServiceProbeMembers(t *testing.T) {
 	selectNames := func() []string {
 		s.mu.Lock()
 		defer s.mu.Unlock()
-		return names(s.selectServiceProbeMembersLocked(s.Proxies(), now))
+		members, _ := s.selectServiceProbeMembersLocked(s.Proxies(), now)
+		return names(members)
 	}
 
-	// Bootstrap: no verdict exists, so every alive member is probed at once.
+	// Bootstrap: no verdict exists, so every alive candidate is probed at once.
 	if got, want := selectNames(), []string{"Alive", "Slow"}; !slices.Equal(got, want) {
-		t.Fatalf("bootstrap must probe every alive member, want %v got %v", want, got)
+		t.Fatalf("bootstrap must probe every alive candidate, want %v got %v", want, got)
 	}
 
 	// A fresh verdict takes the member out until the refresh window lapses.
@@ -318,34 +435,59 @@ func TestSmartSelectServiceProbeMembers(t *testing.T) {
 
 func TestSmartSelectServiceProbeMembersBatchCap(t *testing.T) {
 	var proxies []C.Proxy
-	for i := 0; i < 20; i++ {
+	for i := 0; i < 40; i++ {
 		proxies = append(proxies, newFakeProxy(fmt.Sprintf("P%02d", i), uint16(100+i*50)))
 	}
 	s := newTestSmartWithProxies(proxies...)
 	s.service = "youtube"
 	now := time.Now()
-	// One member is already fresh, so the run is incremental and capped.
-	s.verdicts["P00"] = serviceVerdict{at: now, known: true}
+	candidates := make(map[string]struct{}, serviceProbeCandidates)
+	for i := 0; i < serviceProbeCandidates; i++ {
+		candidates[fmt.Sprintf("P%02d", i)] = struct{}{}
+	}
 
+	// A bootstrap run is incremental too: it only touches the best-scored
+	// candidates, never the whole roster.
 	s.mu.Lock()
-	selected := s.selectServiceProbeMembersLocked(s.Proxies(), now)
+	selected, offered := s.selectServiceProbeMembersLocked(s.Proxies(), now)
 	s.mu.Unlock()
+	if offered != serviceProbeCandidates {
+		t.Fatalf("the candidate set must cap at %d, got %d", serviceProbeCandidates, offered)
+	}
 	if len(selected) != serviceProbeBatch {
-		t.Fatalf("an incremental run must cap at %d members, got %d", serviceProbeBatch, len(selected))
+		t.Fatalf("a run must cap at %d members, got %d", serviceProbeBatch, len(selected))
 	}
 	for _, proxy := range selected {
-		if proxy.Name() == "P19" {
-			t.Fatal("the worst-scored tail must wait for a later run")
+		if _, ok := candidates[proxy.Name()]; !ok {
+			t.Fatalf("a member outside the candidate set must not be probed: %v", names(selected))
 		}
 	}
 
-	// The cap lifts only when no fresh verdict exists at all.
+	// The next run continues with the candidates the first one left behind.
 	s.mu.Lock()
-	delete(s.verdicts, "P00")
-	full := s.selectServiceProbeMembersLocked(s.Proxies(), now)
+	for _, proxy := range selected {
+		s.verdicts[proxy.Name()] = serviceVerdict{at: now, known: true}
+	}
+	second, _ := s.selectServiceProbeMembersLocked(s.Proxies(), now)
 	s.mu.Unlock()
-	if len(full) != 20 {
-		t.Fatalf("a bootstrap run must sweep every alive member, got %d", len(full))
+	if len(second) != serviceProbeCandidates-serviceProbeBatch {
+		t.Fatalf("the second run must finish the candidates, got %v", names(second))
+	}
+	for _, proxy := range second {
+		if _, ok := candidates[proxy.Name()]; !ok {
+			t.Fatalf("a member outside the candidate set must not be probed: %v", names(second))
+		}
+	}
+
+	// Once every candidate is fresh the roster tail still waits untouched.
+	s.mu.Lock()
+	for _, proxy := range second {
+		s.verdicts[proxy.Name()] = serviceVerdict{at: now, known: true}
+	}
+	idle, _ := s.selectServiceProbeMembersLocked(s.Proxies(), now)
+	s.mu.Unlock()
+	if len(idle) != 0 {
+		t.Fatalf("a fresh candidate set must not probe the roster tail, got %v", names(idle))
 	}
 }
 
@@ -392,6 +534,41 @@ func TestSmartOrderedCandidatesSkipsBlocked(t *testing.T) {
 	}
 	if got, want := names(order), []string{"b", "c", "a", "dead"}; !slices.Equal(got, want) {
 		t.Fatalf("healthy, then service-blocked, then dead expected %v, got %v", want, got)
+	}
+}
+
+func TestSmartServicePrefersVerifiedMember(t *testing.T) {
+	unknown := newFakeProxy("Unknown", 100)           // fastest, never probed
+	fastVerified := newFakeProxy("FastVerified", 400) // confirmed, slower than Unknown
+	slowVerified := newFakeProxy("SlowVerified", 600)
+	s := newTestSmartWithProxies(unknown, fastVerified, slowVerified)
+	s.service = "google-gemini"
+	now := time.Now()
+	s.verdicts["FastVerified"] = serviceVerdict{at: now, known: true}
+	s.verdicts["SlowVerified"] = serviceVerdict{at: now, known: true}
+	s.lastProbe = now
+
+	order := s.orderedCandidates(&C.Metadata{Host: "gemini.google.com"}, false)
+	if got, want := names(order), []string{"FastVerified", "SlowVerified", "Unknown"}; !slices.Equal(got, want) {
+		t.Fatalf("probe-confirmed members must come first, fastest of them leading: want %v got %v", want, got)
+	}
+}
+
+func TestSmartServiceVerifiedLapsesOnFailedProbe(t *testing.T) {
+	unknown := newFakeProxy("Unknown", 100)
+	verified := newFakeProxy("Verified", 400)
+	s := newTestSmartWithProxies(unknown, verified)
+	s.service = "google-gemini"
+	now := time.Now()
+	s.verdicts["Verified"] = serviceVerdict{at: now, known: true}
+	// One unanswered request since the verdict is enough to drop the
+	// confirmation, even though it is not enough to demote the member.
+	s.attempts["Verified"] = serviceProbeAttempt{at: now, fails: 1, misses: 1}
+	s.lastProbe = now
+
+	order := s.orderedCandidates(&C.Metadata{Host: "gemini.google.com"}, false)
+	if got, want := names(order), []string{"Unknown", "Verified"}; !slices.Equal(got, want) {
+		t.Fatalf("a failed probe must drop the confirmation, want %v got %v", want, got)
 	}
 }
 
@@ -750,16 +927,17 @@ func TestSmartBlockedVerdictTrustedDuringBackoff(t *testing.T) {
 	expired := serviceVerdict{at: now.Add(-serviceVerdictTTL - time.Minute), known: true, blocked: true}
 	s.mu.Lock()
 	s.verdicts["a"] = fresh
-	trusted := s.serviceBlockedLocked("a", now)
+	trusted := s.serviceUnusableLocked("a", now)
 	s.verdicts["a"] = expired
 	s.attempts["a"] = serviceProbeAttempt{at: now.Add(-time.Minute), misses: 2}
-	trustedDuringBackoff := s.serviceBlockedLocked("a", now)
+	trustedDuringBackoff := s.serviceUnusableLocked("a", now)
 	s.attempts["a"] = serviceProbeAttempt{at: now.Add(-serviceProbeRetryMax - time.Minute), misses: 2}
-	lapsed := s.serviceBlockedLocked("a", now)
+	lapsed := s.serviceUnusableLocked("a", now)
 	// An allowed verdict gets no such extension: an expired allowed member is
-	// simply no longer boosted, and misses never demote it.
+	// simply no longer boosted, and undecidable answers alone never demote it.
+	// Repeated transport failures do, and they have their own test.
 	s.verdicts["a"] = serviceVerdict{at: expired.at, known: true}
-	allowed := s.serviceBlockedLocked("a", now)
+	allowed := s.serviceUnusableLocked("a", now)
 	s.mu.Unlock()
 
 	if !trusted {
@@ -772,6 +950,6 @@ func TestSmartBlockedVerdictTrustedDuringBackoff(t *testing.T) {
 		t.Fatal("the extended trust must lapse with the backoff window")
 	}
 	if allowed {
-		t.Fatal("an expired allowed verdict must never demote, misses or not")
+		t.Fatal("an expired allowed verdict must not demote on undecidable answers alone")
 	}
 }

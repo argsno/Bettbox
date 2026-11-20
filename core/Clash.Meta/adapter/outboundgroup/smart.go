@@ -294,7 +294,7 @@ func (s *Smart) Now() string {
 			}
 		}
 		score := s.scoreOf(proxy, st, now)
-		if s.serviceBlockedLocked(name, now) {
+		if s.serviceUnusableLocked(name, now) {
 			if score < blockedScore {
 				blockedScore = score
 				blockedScoreName = name
@@ -309,7 +309,7 @@ func (s *Smart) Now() string {
 	// A policy that still carries recent traffic can have failed its service
 	// probe since; report the best usable one so the panel never advertises a
 	// member the group will not pick first.
-	if bestName != "" && (bestScoreName == "" || !s.serviceBlockedLocked(bestName, now)) {
+	if bestName != "" && (bestScoreName == "" || !s.serviceUnusableLocked(bestName, now)) {
 		return bestName
 	}
 	if bestScoreName != "" {
@@ -643,10 +643,11 @@ func (s *Smart) healthCheck() {
 }
 
 type smartCandidate struct {
-	proxy   C.Proxy
-	score   float64
-	alive   bool
-	blocked bool // last service probe says this member cannot serve the service
+	proxy    C.Proxy
+	score    float64
+	alive    bool
+	blocked  bool // probe verdict or repeated failures say this member cannot serve the service
+	verified bool // a decidable probe confirmed this member can serve the service
 }
 
 // siteStatus classifies a policy for one destination using a snapshot of the
@@ -688,21 +689,44 @@ func stickySitePick(ranked []smartCandidate, preferred []int, entries map[string
 }
 
 // preferredBandPick returns the first choice among the policies inside the
-// preferred band around the best usable score. Sticky picks the band member
-// with the newest success -- Google and OpenAI tie sessions to the egress IP,
-// so a service group keeps answering on one member. Deterministic fixes the
-// cold start on the best band member so the first burst of connections
-// concentrates on one machine and forms the pin; without it the pick rotates
-// randomly inside the band, spreading load by design. General groups pass
-// neither flag.
+// preferred band around the best usable score. A service group first narrows
+// the field to members whose probe confirmed the service works: an unverified
+// member only competes when no verified one is usable, so latency alone never
+// outranks a confirmed member. Sticky picks the band member with the newest
+// success -- Google and OpenAI tie sessions to the egress IP, so a service
+// group keeps answering on one member. Deterministic fixes the cold start on
+// the best band member so the first burst of connections concentrates on one
+// machine and forms the pin; without it the pick rotates randomly inside the
+// band, spreading load by design. General groups pass neither flag.
 func preferredBandPick(ranked []smartCandidate, entries map[string]smartSiteEntry, now time.Time, sticky, deterministic bool) (int, bool) {
-	best := 0.0
-	hasBest := false
+	// A verification is only worth preferring while one is actually usable;
+	// otherwise the group would fall back to a slower member or stay empty.
+	verifiedUsable := false
 	for _, item := range ranked {
-		if !item.alive || item.blocked {
+		if !item.alive || item.blocked || !item.verified {
 			continue
 		}
 		if _, miss := siteStatus(entries, item.proxy.Name(), now); miss {
+			continue
+		}
+		verifiedUsable = true
+		break
+	}
+	usable := func(item smartCandidate) bool {
+		if !item.alive || item.blocked {
+			return false
+		}
+		if verifiedUsable && !item.verified {
+			return false
+		}
+		_, miss := siteStatus(entries, item.proxy.Name(), now)
+		return !miss
+	}
+
+	best := 0.0
+	hasBest := false
+	for _, item := range ranked {
+		if !usable(item) {
 			continue
 		}
 		best = item.score
@@ -716,13 +740,10 @@ func preferredBandPick(ranked []smartCandidate, entries map[string]smartSiteEntr
 	baseGap := math.Max(best*smartPreferredGapRatio, smartPreferredGapMin)
 	var preferred []int
 	for i, item := range ranked {
-		if !item.alive || item.blocked {
+		if !usable(item) {
 			continue
 		}
-		hit, miss := siteStatus(entries, item.proxy.Name(), now)
-		if miss {
-			continue
-		}
+		hit, _ := siteStatus(entries, item.proxy.Name(), now)
 		gap := baseGap
 		if hit {
 			gap = math.Max(best*smartSitePreferredGap, smartPreferredGapMin)
@@ -775,10 +796,11 @@ func (s *Smart) rankedCandidates(proxies []C.Proxy, now time.Time) []smartCandid
 		}
 		st := s.states[proxy.Name()]
 		candidates = append(candidates, smartCandidate{
-			proxy:   proxy,
-			score:   s.scoreOf(proxy, st, now),
-			alive:   proxy.AliveForTestUrl(s.testUrl),
-			blocked: s.serviceBlockedLocked(proxy.Name(), now),
+			proxy:    proxy,
+			score:    s.scoreOf(proxy, st, now),
+			alive:    proxy.AliveForTestUrl(s.testUrl),
+			blocked:  s.serviceUnusableLocked(proxy.Name(), now),
+			verified: s.serviceVerifiedLocked(proxy.Name(), now),
 		})
 	}
 	s.mu.Unlock()
@@ -882,12 +904,21 @@ func (s *Smart) orderedCandidates(metadata *C.Metadata, touch bool) []C.Proxy {
 		first := ranked[firstPick]
 		hit, miss := siteStatus(siteEntries, first.proxy.Name(), now)
 		order = append(order, first.proxy)
-		log.Debugln("[Smart] %s picked %s (score %.1fms, siteHit=%t, siteMiss=%t, site=%q)",
-			s.Name(), first.proxy.Name(), first.score, hit, miss, siteKey)
+		log.Debugln("[Smart] %s picked %s (score %.1fms, siteHit=%t, siteMiss=%t, verified=%t, site=%q)",
+			s.Name(), first.proxy.Name(), first.score, hit, miss, first.verified, siteKey)
 	}
 
+	// The fallback follows the same evidence order as the first pick: members a
+	// probe confirmed, then never-probed ones, then members the service refused,
+	// and finally members whose URL test failed.
 	for i, item := range ranked {
-		if i == firstPick || !item.alive || item.blocked {
+		if i == firstPick || !item.alive || item.blocked || !item.verified {
+			continue
+		}
+		order = append(order, item.proxy)
+	}
+	for i, item := range ranked {
+		if i == firstPick || !item.alive || item.blocked || item.verified {
 			continue
 		}
 		order = append(order, item.proxy)

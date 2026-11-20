@@ -21,7 +21,10 @@ import (
 // the media unlock panel and the core ranks members by the same rules, so a
 // region edit must land on both sides.
 const (
-	serviceProbeTimeout = 5 * time.Second
+	// serviceProbeTimeout covers the whole request including the body read. The
+	// Gemini preset reads a full page to reach its region payload, so a tight
+	// deadline would fail members that are merely slow instead of unreachable.
+	serviceProbeTimeout = 15 * time.Second
 	serviceProbeWorkers = 8
 	// serviceProbeInterval throttles run starts, not member probes: runs are
 	// incremental, so re-checking the member list once a minute is cheap.
@@ -29,20 +32,34 @@ const (
 	// serviceVerdictRefresh is when a known verdict is re-probed. It sits below
 	// the TTL with a margin wider than the run throttle plus a probe timeout,
 	// so a member in active use never has its verdict lapse between runs.
-	serviceVerdictRefresh = 15 * time.Minute
+	serviceVerdictRefresh = 30 * time.Minute
 	// serviceVerdictTTL is how long a verdict is trusted for ranking when no
 	// newer answer arrives (the group is idle or the probes keep failing).
-	serviceVerdictTTL = 20 * time.Minute
+	serviceVerdictTTL = 45 * time.Minute
 	// serviceProbeRetry paces the retry of a member whose last attempt produced
 	// no decidable answer; consecutive misses double it up to serviceProbeRetryMax,
 	// so an unreachable member is relearned quickly at first and rarely later.
 	serviceProbeRetry    = 5 * time.Minute
 	serviceProbeRetryMax = 40 * time.Minute
+	// serviceProbeFailLimit is how many consecutive requests without any answer
+	// demote a member. A decidable verdict is not the only evidence: an egress
+	// that keeps resetting or black-holing the service is unusable even though
+	// no probe ever produced a verdict about it.
+	serviceProbeFailLimit = 3
 	// serviceProbeBatch caps one run; deeper members wait for later runs, so
 	// the probe budget follows the ranking instead of the roster.
 	serviceProbeBatch = 12
+	// serviceProbeCandidates caps how many of the best-scored members the group
+	// is willing to verify. A member far down the ranking can never be picked
+	// first, so probing it would only spend the service's traffic; the limit
+	// also keeps a bootstrap from sweeping the whole roster.
+	serviceProbeCandidates = 24
 
 	serviceProbeMaxBody = 256 << 10
+	// serviceProbeGeminiMaxBody covers the region payload of the Gemini page,
+	// which sits past the first megabyte; the default cap would truncate it and
+	// leave every member with an unreadable region.
+	serviceProbeGeminiMaxBody = 2 << 20
 )
 
 type servicePreset struct {
@@ -57,7 +74,13 @@ type servicePreset struct {
 	// unavailablePhrases mark a 200 page as unusable; matched against the lower
 	// cased body.
 	unavailablePhrases []string
-	blocked            map[string]struct{}
+	// maxBody caps the response read; zero means serviceProbeMaxBody.
+	maxBody int64
+	// skipBody judges the member from the status and the final URL only and
+	// leaves the response body unread. It pauses a body check whose page is too
+	// heavy for what the check adds to the routing decision.
+	skipBody bool
+	blocked  map[string]struct{}
 }
 
 var servicePresets = map[string]servicePreset{
@@ -71,8 +94,9 @@ var servicePresets = map[string]servicePreset{
 	},
 	"google-gemini": {
 		url:            "https://gemini.google.com/",
+		maxBody:        serviceProbeGeminiMaxBody,
 		regionPatterns: geminiRegionPatterns,
-		blockedPaths:   []string{"sorry.google.com"},
+		blockedPaths:   []string{"sorry.google.com", "unavailable"},
 		unavailablePhrases: []string{
 			"not supported in your country",
 			"isn't supported in your country",
@@ -95,8 +119,16 @@ var servicePresets = map[string]servicePreset{
 	// YouTube is not refused by region: a member only fails when the request
 	// itself lands on an unavailable page. The region stays for logging and for
 	// the app's unlock panel, so the preset keeps no blocked region.
+	//
+	// The body judgment is paused: /premium is a ~1 MB page and the phrases it
+	// adds almost never change the routing decision, so the probe only reads the
+	// status and the final URL (skipBody). The rules stay here for the restart;
+	// restoring them means dropping skipBody and reading the page incrementally
+	// up to the region marker, which the first pattern already finds at ~62 KB.
+	// TODO: restore the body checks with that incremental read.
 	"youtube": {
 		url:            "https://www.youtube.com/premium",
+		skipBody:       true,
 		regionPatterns: youtubeRegionPatterns,
 		blockedPaths:   []string{"sorry.google.com", "www.google.cn"},
 		unavailablePhrases: []string{
@@ -127,6 +159,14 @@ func serviceRegionSet(regions ...string) map[string]struct{} {
 	return set
 }
 
+// serviceBodyLimit is the response read cap for one preset.
+func serviceBodyLimit(preset servicePreset) int64 {
+	if preset.maxBody > 0 {
+		return preset.maxBody
+	}
+	return serviceProbeMaxBody
+}
+
 // normalizeServiceName maps the configured value onto a preset key and reports
 // a typo instead of silently ranking every member the same.
 func normalizeServiceName(name string) (string, error) {
@@ -149,7 +189,8 @@ type serviceVerdict struct {
 }
 
 // serviceProbeOutcome is one member's result in a probe run: done is false
-// when the request itself failed, in which case only the attempt is recorded.
+// when the request itself failed, in which case only the attempt is recorded
+// and the member's failure streak grows.
 type serviceProbeOutcome struct {
 	verdict serviceVerdict
 	done    bool
@@ -157,10 +198,13 @@ type serviceProbeOutcome struct {
 
 // serviceProbeAttempt records a member's last probe try, decidable or not.
 // misses counts the consecutive tries that produced no decidable answer and
-// drives the exponential backoff; a decidable answer resets it.
+// drives the exponential backoff; a decidable answer resets it. fails counts
+// the consecutive tries whose request never completed at all: a response, even
+// an undecidable one, proves the member can reach the service.
 type serviceProbeAttempt struct {
 	at     time.Time
 	misses int
+	fails  int
 }
 
 // backoff doubles serviceProbeRetry per consecutive miss, capped at
@@ -290,13 +334,18 @@ func probeServiceVerdict(ctx context.Context, proxyName, service string) (servic
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, serviceProbeMaxBody))
-	if err != nil {
-		return serviceVerdict{}, err
-	}
 	finalURL := ""
 	if resp.Request != nil && resp.Request.URL != nil {
 		finalURL = resp.Request.URL.String()
+	}
+	// Closing an unread body aborts the transfer: a paused body check must not
+	// pay for the page it would have inspected.
+	if preset.skipBody {
+		return evaluateServiceResponse(preset, resp.StatusCode, finalURL, ""), nil
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, serviceBodyLimit(preset)))
+	if err != nil {
+		return serviceVerdict{}, err
 	}
 	return evaluateServiceResponse(preset, resp.StatusCode, finalURL, string(body)), nil
 }
@@ -338,27 +387,19 @@ func (s *Smart) probeServiceMembers(proxies []C.Proxy, service string) map[strin
 }
 
 // selectServiceProbeMembersLocked returns the members the next run should
-// probe: alive members without a fresh verdict, best score first, capped at
-// serviceProbeBatch. With no fresh verdict at all the cap is lifted, so a group
-// bootstrapping or waking from idle re-learns its whole roster in one run.
-// Callers must hold s.mu.
-func (s *Smart) selectServiceProbeMembersLocked(proxies []C.Proxy, now time.Time) []C.Proxy {
-	fresh := 0
-	type pendingMember struct {
+// probe: the best-scored alive members without a fresh verdict, capped at
+// serviceProbeBatch, and reports how many candidates the ranking offered. Only
+// the members near the top can be picked first, so the group spends the
+// service's traffic on those instead of the whole roster. Callers must hold
+// s.mu.
+func (s *Smart) selectServiceProbeMembersLocked(proxies []C.Proxy, now time.Time) ([]C.Proxy, int) {
+	type candidate struct {
 		proxy C.Proxy
 		score float64
 	}
-	pending := make([]pendingMember, 0, len(proxies))
+	ranking := make([]candidate, 0, len(proxies))
 	for _, proxy := range proxies {
 		if proxy == nil {
-			continue
-		}
-		name := proxy.Name()
-		if verdict, ok := s.verdicts[name]; ok && verdict.known && now.Sub(verdict.at) < serviceVerdictRefresh {
-			fresh++
-			continue
-		}
-		if attempt, ok := s.attempts[name]; ok && now.Sub(attempt.at) < attempt.backoff() {
 			continue
 		}
 		// A member whose URL test failed cannot be picked anyway; its verdict
@@ -366,22 +407,27 @@ func (s *Smart) selectServiceProbeMembersLocked(proxies []C.Proxy, now time.Time
 		if !proxy.AliveForTestUrl(s.testUrl) {
 			continue
 		}
-		pending = append(pending, pendingMember{proxy: proxy, score: s.scoreOf(proxy, s.states[name], now)})
+		ranking = append(ranking, candidate{proxy: proxy, score: s.scoreOf(proxy, s.states[proxy.Name()], now)})
 	}
-	if len(pending) == 0 {
-		return nil
+	sort.SliceStable(ranking, func(i, j int) bool { return ranking[i].score < ranking[j].score })
+	if len(ranking) > serviceProbeCandidates {
+		ranking = ranking[:serviceProbeCandidates]
 	}
-	if fresh > 0 {
-		sort.SliceStable(pending, func(i, j int) bool { return pending[i].score < pending[j].score })
-		if len(pending) > serviceProbeBatch {
-			pending = pending[:serviceProbeBatch]
+	pending := make([]C.Proxy, 0, len(ranking))
+	for _, item := range ranking {
+		name := item.proxy.Name()
+		if verdict, ok := s.verdicts[name]; ok && verdict.known && now.Sub(verdict.at) < serviceVerdictRefresh {
+			continue
 		}
+		if attempt, ok := s.attempts[name]; ok && now.Sub(attempt.at) < attempt.backoff() {
+			continue
+		}
+		pending = append(pending, item.proxy)
 	}
-	members := make([]C.Proxy, 0, len(pending))
-	for _, item := range pending {
-		members = append(members, item.proxy)
+	if len(pending) > serviceProbeBatch {
+		pending = pending[:serviceProbeBatch]
 	}
-	return members
+	return pending, len(ranking)
 }
 
 // maybeProbeService probes the members that currently lack a fresh verdict, on
@@ -399,7 +445,7 @@ func (s *Smart) maybeProbeService(proxies []C.Proxy) {
 		s.mu.Unlock()
 		return
 	}
-	selected := s.selectServiceProbeMembersLocked(proxies, now)
+	selected, candidates := s.selectServiceProbeMembersLocked(proxies, now)
 	if len(selected) == 0 {
 		s.mu.Unlock()
 		return
@@ -409,8 +455,8 @@ func (s *Smart) maybeProbeService(proxies []C.Proxy) {
 	s.mu.Unlock()
 
 	go func() {
-		log.Debugln("[Smart] %s: probing %d/%d members for service %s",
-			s.Name(), len(selected), len(proxies), s.service)
+		log.Debugln("[Smart] %s: probing %d of %d candidates (%d members) for service %s",
+			s.Name(), len(selected), candidates, len(proxies), s.service)
 		outcomes := s.probeServiceMembers(selected, s.service)
 		s.mu.Lock()
 		s.probing = false
@@ -423,8 +469,11 @@ func (s *Smart) maybeProbeService(proxies []C.Proxy) {
 // applyProbeOutcomesLocked records one run's results: a known verdict replaces
 // the member's previous one, while an undecidable answer or a failed request
 // only marks the attempt, so the old verdict keeps its weight until its TTL and
-// the member is not retried immediately. Verdicts of members that left the
-// group are dropped instead of lingering forever. Callers must hold s.mu.
+// the member is not retried immediately. Repeated unanswered requests are the
+// exception: they demote the member until it answers again, because an egress
+// that keeps resetting the service is unusable even when no probe ever decided
+// about it. Verdicts of members that left the group are dropped instead of
+// lingering forever. Callers must hold s.mu.
 func (s *Smart) applyProbeOutcomesLocked(outcomes map[string]serviceProbeOutcome, members []C.Proxy, now time.Time) {
 	current := make(map[string]struct{}, len(members))
 	for _, proxy := range members {
@@ -436,9 +485,13 @@ func (s *Smart) applyProbeOutcomesLocked(outcomes map[string]serviceProbeOutcome
 		if s.attempts == nil {
 			s.attempts = make(map[string]serviceProbeAttempt, len(outcomes))
 		}
+		previous := s.attempts[name]
 		attempt := serviceProbeAttempt{at: now}
+		if !outcome.done {
+			attempt.fails = previous.fails + 1
+		}
 		if !(outcome.done && outcome.verdict.known) {
-			attempt.misses = s.attempts[name].misses + 1
+			attempt.misses = previous.misses + 1
 		}
 		s.attempts[name] = attempt
 		if outcome.done && outcome.verdict.known {
@@ -446,6 +499,14 @@ func (s *Smart) applyProbeOutcomesLocked(outcomes map[string]serviceProbeOutcome
 				s.verdicts = make(map[string]serviceVerdict, len(outcomes))
 			}
 			s.verdicts[name] = outcome.verdict
+		}
+		// Only the transitions are logged: every failed attempt is already logged
+		// by the probe itself, and the threshold is what changes the routing.
+		if previous.fails < serviceProbeFailLimit && attempt.fails >= serviceProbeFailLimit {
+			log.Debugln("[Smart] service %s via %s: %d probes without an answer, demoted",
+				s.service, name, attempt.fails)
+		} else if previous.fails >= serviceProbeFailLimit && attempt.fails == 0 {
+			log.Debugln("[Smart] service %s via %s: probe answered again, usable", s.service, name)
 		}
 	}
 	for name := range s.verdicts {
@@ -460,11 +521,40 @@ func (s *Smart) applyProbeOutcomesLocked(outcomes map[string]serviceProbeOutcome
 	}
 }
 
-// serviceBlockedLocked reports whether the member failed its last service
-// probe. Callers must hold s.mu.
-func (s *Smart) serviceBlockedLocked(name string, now time.Time) bool {
+// serviceVerifiedLocked reports whether the member's last decidable probe
+// confirmed it can serve the service and nothing has failed since. The group
+// prefers these members over ones it never probed: a confirmation is stronger
+// evidence than a low latency. Callers must hold s.mu.
+func (s *Smart) serviceVerifiedLocked(name string, now time.Time) bool {
 	if s.service == "" {
 		return false
+	}
+	verdict, ok := s.verdicts[name]
+	if !ok || !verdict.known || verdict.blocked || now.Sub(verdict.at) > serviceVerdictTTL {
+		return false
+	}
+	// A request that failed after the verdict means the member can no longer be
+	// confirmed even before the failure streak crosses the demotion limit; the
+	// next answered probe re-confirms it.
+	if attempt, ok := s.attempts[name]; ok && attempt.fails > 0 {
+		return false
+	}
+	return true
+}
+
+// serviceUnusableLocked reports whether the member should stay out of the
+// preferred pick: the last decidable probe refused it, or its requests keep
+// failing without producing an answer at all. Callers must hold s.mu.
+func (s *Smart) serviceUnusableLocked(name string, now time.Time) bool {
+	if s.service == "" {
+		return false
+	}
+	// An egress that keeps resetting the service is unusable even though no
+	// probe ever produced a verdict: an allowed answer that is minutes or hours
+	// old must not be the only reason to keep routing there. The demotion lapses
+	// with the backoff window, so the member is re-tried and can recover.
+	if attempt, ok := s.attempts[name]; ok && attempt.fails >= serviceProbeFailLimit && now.Sub(attempt.at) < attempt.backoff() {
+		return true
 	}
 	verdict, ok := s.verdicts[name]
 	if !ok || !verdict.known {
