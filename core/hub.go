@@ -462,6 +462,27 @@ func testProxyDelay(ctx context.Context, name, testUrl string, timeout int64) De
 	return delay
 }
 
+// forceServiceProbe lets a manual delay test double as a forced re-test of the
+// smart service groups: each group re-probes the tested members it currently
+// demotes, ignoring the retry backoff. Groups without a service policy and
+// members that are not demoted cost nothing.
+func forceServiceProbe(names []string) {
+	if len(names) == 0 {
+		return
+	}
+	for _, proxy := range tunnel.Proxies() {
+		_, group, ok := proxyGroupOf(proxy)
+		if !ok {
+			continue
+		}
+		smart, ok := group.(*outboundgroup.Smart)
+		if !ok {
+			continue
+		}
+		smart.ForceServiceProbe(names)
+	}
+}
+
 func handleAsyncTestDelay(paramsString string, fn func(string)) {
 	mBatch.Go(paramsString, func() (bool, error) {
 		var params = &TestDelayParams{}
@@ -473,6 +494,7 @@ func handleAsyncTestDelay(paramsString string, fn func(string)) {
 		ctx, batch := startDelayBatch([]delayTarget{{Name: params.ProxyName, Url: testUrl}})
 		delay := testProxyDelay(ctx, params.ProxyName, testUrl, params.Timeout)
 		finishDelayBatch(batch)
+		forceServiceProbe([]string{params.ProxyName})
 		data, _ := json.Marshal(delay)
 		fn(string(data))
 		return false, nil

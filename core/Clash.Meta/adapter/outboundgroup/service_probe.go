@@ -46,14 +46,14 @@ const (
 	// that keeps resetting or black-holing the service is unusable even though
 	// no probe ever produced a verdict about it.
 	serviceProbeFailLimit = 3
-	// serviceProbeBatch caps one run; deeper members wait for later runs, so
-	// the probe budget follows the ranking instead of the roster.
+	// serviceProbeBatch caps one run. It matches the candidate cap today, so a
+	// bootstrap finishes in one run instead of two.
 	serviceProbeBatch = 12
 	// serviceProbeCandidates caps how many of the best-scored members the group
-	// is willing to verify. A member far down the ranking can never be picked
-	// first, so probing it would only spend the service's traffic; the limit
-	// also keeps a bootstrap from sweeping the whole roster.
-	serviceProbeCandidates = 24
+	// is willing to probe and keep verified. A member far down the ranking can
+	// never be picked first, so probing it would only spend the service's
+	// traffic; the limit also keeps a bootstrap from sweeping the whole roster.
+	serviceProbeCandidates = 12
 
 	serviceProbeMaxBody = 256 << 10
 	// serviceProbeGeminiMaxBody covers the region payload of the Gemini page,
@@ -123,9 +123,9 @@ var servicePresets = map[string]servicePreset{
 	// The body judgment is paused: /premium is a ~1 MB page and the phrases it
 	// adds almost never change the routing decision, so the probe only reads the
 	// status and the final URL (skipBody). The rules stay here for the restart;
-	// restoring them means dropping skipBody and reading the page incrementally
-	// up to the region marker, which the first pattern already finds at ~62 KB.
-	// TODO: restore the body checks with that incremental read.
+	// dropping skipBody is enough, because the incremental read already stops at
+	// the first region marker (~62 KB for this page).
+	// TODO: restore the body checks once the pause is no longer needed.
 	"youtube": {
 		url:            "https://www.youtube.com/premium",
 		skipBody:       true,
@@ -165,6 +165,53 @@ func serviceBodyLimit(preset servicePreset) int64 {
 		return preset.maxBody
 	}
 	return serviceProbeMaxBody
+}
+
+const (
+	// serviceBodyChunk is the read size of the incremental body scan. Chunking
+	// lets the scan stop at the region marker instead of paying for the rest of
+	// a ~1 MB page.
+	serviceBodyChunk = 32 << 10
+	// serviceBodyOverlap keeps a region pattern that straddles two chunks intact.
+	serviceBodyOverlap = 256
+)
+
+// readServiceBody reads the response up to the preset's cap and stops as soon
+// as a region pattern matches. The Gemini region payload sits at ~84% of a
+// ~1 MB page, so reading past it buys nothing; a page without the marker is
+// still read to the cap or the end of the body. Each pattern is matched against
+// the newest chunk plus an overlap, so the patterns must stay unanchored.
+func readServiceBody(preset servicePreset, body io.Reader) (string, error) {
+	reader := io.LimitReader(body, serviceBodyLimit(preset))
+	buf := make([]byte, 0, serviceBodyChunk)
+	chunk := make([]byte, serviceBodyChunk)
+	scanned := 0
+	for {
+		n, err := reader.Read(chunk)
+		if n > 0 {
+			buf = append(buf, chunk[:n]...)
+			if len(preset.regionPatterns) > 0 {
+				start := scanned - serviceBodyOverlap
+				if start < 0 {
+					start = 0
+				}
+				end := len(buf)
+				scanned = end
+				for _, pattern := range preset.regionPatterns {
+					if pattern.Match(buf[start:end]) {
+						return string(buf), nil
+					}
+				}
+			}
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return "", err
+		}
+	}
+	return string(buf), nil
 }
 
 // normalizeServiceName maps the configured value onto a preset key and reports
@@ -343,11 +390,11 @@ func probeServiceVerdict(ctx context.Context, proxyName, service string) (servic
 	if preset.skipBody {
 		return evaluateServiceResponse(preset, resp.StatusCode, finalURL, ""), nil
 	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, serviceBodyLimit(preset)))
+	body, err := readServiceBody(preset, resp.Body)
 	if err != nil {
 		return serviceVerdict{}, err
 	}
-	return evaluateServiceResponse(preset, resp.StatusCode, finalURL, string(body)), nil
+	return evaluateServiceResponse(preset, resp.StatusCode, finalURL, body), nil
 }
 
 func (s *Smart) probeServiceMembers(proxies []C.Proxy, service string) map[string]serviceProbeOutcome {
@@ -450,20 +497,152 @@ func (s *Smart) maybeProbeService(proxies []C.Proxy) {
 		s.mu.Unlock()
 		return
 	}
-	s.probing = true
-	s.lastProbe = now
+	log.Debugln("[Smart] %s: probing %d of %d candidates (%d members) for service %s",
+		s.Name(), len(selected), candidates, len(proxies), s.service)
+	s.startServiceProbeLocked(selected, proxies)
 	s.mu.Unlock()
+}
 
+// ForceServiceProbe re-probes the named members now, ignoring the verdict
+// freshness and the retry backoff. The app calls it when the user manually
+// tests a node, so a demoted member can be recovered without waiting for its
+// backoff window. Among the tested names, the member the group currently uses
+// is always re-probed: a manual test of the selected node must confirm it even
+// when its stored verdict still says usable, so a failure can move the group
+// to another member. The other tested members are probed only when they are
+// currently unusable.
+func (s *Smart) ForceServiceProbe(names []string) {
+	if s.service == "" || len(names) == 0 {
+		return
+	}
+	proxies := s.GetProxies(false)
+	// Read the current pick before taking s.mu: Now() locks it itself.
+	current := s.Now()
+	now := time.Now()
+	s.mu.Lock()
+	if s.probing {
+		// A run is already dialing the service; remember the request and start
+		// it right after instead of racing two runs on one group.
+		if s.forcePending == nil {
+			s.forcePending = make(map[string]struct{}, len(names))
+		}
+		for _, name := range names {
+			s.forcePending[name] = struct{}{}
+		}
+		s.forcePendingCurrent = current
+		s.mu.Unlock()
+		return
+	}
+	targets := s.forceProbeTargetsLocked(proxies, names, current, now)
+	if len(targets) == 0 {
+		s.mu.Unlock()
+		return
+	}
+	log.Debugln("[Smart] %s: force probing %d member(s) for service %s", s.Name(), len(targets), s.service)
+	s.startServiceProbeLocked(targets, proxies)
+	s.mu.Unlock()
+}
+
+// forceProbeTargetsLocked picks the members a manual re-test should probe: the
+// current member when it was tested, plus the other tested members that are
+// currently unusable and alive. The current member takes the first slot even
+// when its score is worse, so it is never cut by the batch cap. Callers must
+// hold s.mu.
+func (s *Smart) forceProbeTargetsLocked(proxies []C.Proxy, names []string, current string, now time.Time) []C.Proxy {
+	wanted := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		wanted[name] = struct{}{}
+	}
+	forceCurrent := false
+	if current != "" {
+		_, forceCurrent = wanted[current]
+	}
+	type candidate struct {
+		proxy C.Proxy
+		score float64
+	}
+	var currentTarget C.Proxy
+	others := make([]candidate, 0, len(names))
+	for _, proxy := range proxies {
+		if proxy == nil {
+			continue
+		}
+		name := proxy.Name()
+		if _, ok := wanted[name]; !ok {
+			continue
+		}
+		// A member whose URL test failed cannot serve anything; the manual test
+		// that triggered this call already showed it is dead.
+		if !proxy.AliveForTestUrl(s.testUrl) {
+			continue
+		}
+		if forceCurrent && name == current {
+			currentTarget = proxy
+			continue
+		}
+		if !s.serviceUnusableLocked(name, now) {
+			continue
+		}
+		others = append(others, candidate{proxy: proxy, score: s.scoreOf(proxy, s.states[name], now)})
+	}
+	sort.SliceStable(others, func(i, j int) bool { return others[i].score < others[j].score })
+	targets := make([]C.Proxy, 0, serviceProbeBatch)
+	if currentTarget != nil {
+		targets = append(targets, currentTarget)
+	}
+	for _, item := range others {
+		if len(targets) >= serviceProbeBatch {
+			break
+		}
+		targets = append(targets, item.proxy)
+	}
+	return targets
+}
+
+// startServiceProbeLocked starts one probe run over targets. members is the
+// full member list, so outcomes for members that left the group are pruned.
+// Callers must hold s.mu.
+func (s *Smart) startServiceProbeLocked(targets, members []C.Proxy) {
+	s.probing = true
+	s.lastProbe = time.Now()
 	go func() {
-		log.Debugln("[Smart] %s: probing %d of %d candidates (%d members) for service %s",
-			s.Name(), len(selected), candidates, len(proxies), s.service)
-		outcomes := s.probeServiceMembers(selected, s.service)
+		outcomes := s.probeServiceMembers(targets, s.service)
 		s.mu.Lock()
 		s.probing = false
-		s.applyProbeOutcomesLocked(outcomes, proxies, time.Now())
+		s.applyProbeOutcomesLocked(outcomes, members, time.Now())
 		s.invalidateRankCacheLocked()
+		s.startPendingProbeLocked(members, targets)
 		s.mu.Unlock()
 	}()
+}
+
+// startPendingProbeLocked starts the manual re-tests that were queued while a
+// run was in flight, skipping the members that run already covered. Callers
+// must hold s.mu.
+func (s *Smart) startPendingProbeLocked(members, probed []C.Proxy) {
+	if len(s.forcePending) == 0 {
+		return
+	}
+	for _, proxy := range probed {
+		delete(s.forcePending, proxy.Name())
+	}
+	if len(s.forcePending) == 0 {
+		s.forcePending = nil
+		return
+	}
+	names := make([]string, 0, len(s.forcePending))
+	for name := range s.forcePending {
+		names = append(names, name)
+	}
+	s.forcePending = nil
+	current := s.forcePendingCurrent
+	s.forcePendingCurrent = ""
+	targets := s.forceProbeTargetsLocked(members, names, current, time.Now())
+	if len(targets) == 0 {
+		return
+	}
+	log.Debugln("[Smart] %s: force probing %d queued member(s) for service %s", s.Name(), len(targets), s.service)
+	s.startServiceProbeLocked(targets, members)
 }
 
 // applyProbeOutcomesLocked records one run's results: a known verdict replaces

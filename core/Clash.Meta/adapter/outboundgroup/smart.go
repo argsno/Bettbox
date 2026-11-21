@@ -250,6 +250,11 @@ type Smart struct {
 	attempts  map[string]serviceProbeAttempt
 	lastProbe time.Time
 	probing   bool
+	// forcePending holds the members a manual re-test asked for while another
+	// probe run was in flight, and forcePendingCurrent the member the group was
+	// routing through at that moment; the next run picks both up.
+	forcePending        map[string]struct{}
+	forcePendingCurrent string
 }
 
 // Now implements ProxyGroup: the pinned policy, else the member a service

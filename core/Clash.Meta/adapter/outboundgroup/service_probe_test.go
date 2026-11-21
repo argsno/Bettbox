@@ -143,6 +143,65 @@ func TestServicePresetSkipBody(t *testing.T) {
 	}
 }
 
+func TestReadServiceBodyStopsAtRegion(t *testing.T) {
+	preset := servicePresets["google-gemini"]
+	body := strings.Repeat("x", 100<<10) + `,2,1,200,"USA"` + strings.Repeat("y", 200<<10)
+
+	got, err := readServiceBody(preset, strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, `,2,1,200,"USA"`) {
+		t.Fatalf("the region marker must survive the read, got %d bytes", len(got))
+	}
+	if len(got) >= len(body) {
+		t.Fatalf("the scan must stop at the marker, read %d of %d bytes", len(got), len(body))
+	}
+}
+
+func TestReadServiceBodyFindsPatternAcrossChunks(t *testing.T) {
+	preset := servicePresets["google-gemini"]
+	prefix := strings.Repeat("x", serviceBodyChunk-8)
+	body := prefix + `,2,1,200,"USA"` + strings.Repeat("y", 100<<10)
+
+	got, err := readServiceBody(preset, strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, `,2,1,200,"USA"`) {
+		t.Fatalf("a pattern across the chunk boundary must be found, got %d bytes", len(got))
+	}
+	if len(got) >= len(body) {
+		t.Fatalf("the scan must stop at the marker, read %d of %d bytes", len(got), len(body))
+	}
+}
+
+func TestReadServiceBodyCapsWithoutMatch(t *testing.T) {
+	preset := servicePresets["openai"]
+	body := strings.Repeat("x", int(serviceProbeMaxBody)+1024)
+
+	got, err := readServiceBody(preset, strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if int64(len(got)) != int64(serviceProbeMaxBody) {
+		t.Fatalf("a body without a marker must stop at the cap, got %d bytes", len(got))
+	}
+}
+
+func TestReadServiceBodyKeepsUnmatchedBody(t *testing.T) {
+	preset := servicePresets["google-gemini"]
+	body := strings.Repeat("x", 100<<10)
+
+	got, err := readServiceBody(preset, strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != len(body) {
+		t.Fatalf("an unmatched body must be read whole, got %d of %d bytes", len(got), len(body))
+	}
+}
+
 func TestEvaluateYouTubePage(t *testing.T) {
 	// The preset's body judgment is paused (skipBody), but its rules stay in the
 	// preset for the restart; this test keeps them honest until they are wired
@@ -337,6 +396,121 @@ func TestSmartServiceVerified(t *testing.T) {
 	}
 }
 
+func TestSmartForceServiceProbeTargets(t *testing.T) {
+	healthy := newFakeProxy("Healthy", 100)
+	blocked := newFakeProxy("Blocked", 200)
+	demoted := newFakeProxy("Demoted", 300)
+	dead := newFakeProxy("Dead", 50)
+	dead.alive = false
+	s := newTestSmartWithProxies(healthy, blocked, demoted, dead)
+	s.service = "google-gemini"
+	now := time.Now()
+	s.verdicts["Healthy"] = serviceVerdict{at: now, known: true}
+	s.verdicts["Blocked"] = serviceVerdict{at: now, known: true, blocked: true}
+	s.attempts["Demoted"] = serviceProbeAttempt{at: now, fails: serviceProbeFailLimit, misses: serviceProbeFailLimit}
+	s.verdicts["Dead"] = serviceVerdict{at: now, known: true, blocked: true}
+
+	s.mu.Lock()
+	targets := s.forceProbeTargetsLocked(s.Proxies(), []string{"Healthy", "Blocked", "Demoted", "Dead", "Stranger"}, "", now)
+	s.mu.Unlock()
+
+	// Only demoted, alive members are re-tested; the healthy one has nothing to
+	// prove and the dead one just failed the URL test that triggered the call.
+	if got, want := names(targets), []string{"Blocked", "Demoted"}; !slices.Equal(got, want) {
+		t.Fatalf("want %v got %v", want, got)
+	}
+}
+
+func TestSmartForceServiceProbeIncludesCurrent(t *testing.T) {
+	current := newFakeProxy("Current", 900)
+	healthy := newFakeProxy("Healthy", 100)
+	s := newTestSmartWithProxies(current, healthy)
+	s.service = "google-gemini"
+	now := time.Now()
+	s.verdicts["Current"] = serviceVerdict{at: now, known: true}
+	s.verdicts["Healthy"] = serviceVerdict{at: now, known: true}
+
+	s.mu.Lock()
+	targets := s.forceProbeTargetsLocked(s.Proxies(), []string{"Current", "Healthy"}, "Current", now)
+	s.mu.Unlock()
+
+	// The current member is confirmed, but a manual re-test must judge it again
+	// so a failure can move the group; the other confirmed member is skipped.
+	if got, want := names(targets), []string{"Current"}; !slices.Equal(got, want) {
+		t.Fatalf("want %v got %v", want, got)
+	}
+
+	s.mu.Lock()
+	foreign := s.forceProbeTargetsLocked(s.Proxies(), []string{"Healthy"}, "Current", now)
+	s.mu.Unlock()
+	if len(foreign) != 0 {
+		t.Fatalf("the current member must not be probed when it was not tested, got %v", names(foreign))
+	}
+}
+
+func TestSmartForceServiceProbeKeepsCurrentUnderCap(t *testing.T) {
+	current := newFakeProxy("Current", 5000) // worst score: the cap must not drop it
+	proxies := []C.Proxy{current}
+	tested := []string{"Current"}
+	for i := 0; i < serviceProbeBatch; i++ {
+		name := fmt.Sprintf("P%02d", i)
+		proxies = append(proxies, newFakeProxy(name, uint16(100+i*10)))
+		tested = append(tested, name)
+	}
+	s := newTestSmartWithProxies(proxies...)
+	s.service = "google-gemini"
+	now := time.Now()
+	s.verdicts["Current"] = serviceVerdict{at: now, known: true}
+	for _, name := range tested[1:] {
+		s.verdicts[name] = serviceVerdict{at: now, known: true, blocked: true}
+	}
+
+	s.mu.Lock()
+	targets := s.forceProbeTargetsLocked(s.Proxies(), tested, "Current", now)
+	s.mu.Unlock()
+
+	if len(targets) != serviceProbeBatch {
+		t.Fatalf("want %d targets, got %v", serviceProbeBatch, names(targets))
+	}
+	if targets[0].Name() != "Current" {
+		t.Fatalf("the current member must keep the first slot, got %v", names(targets))
+	}
+}
+
+func TestSmartForceServiceProbeQueuesWhileProbing(t *testing.T) {
+	s := newTestSmartWithProxies(newFakeProxy("a", 100))
+	s.service = "google-gemini"
+	s.probing = true
+
+	s.ForceServiceProbe([]string{"a"})
+
+	s.mu.Lock()
+	_, queued := s.forcePending["a"]
+	probing := s.probing
+	s.mu.Unlock()
+	if !queued {
+		t.Fatal("a re-test request during a run must be queued")
+	}
+	if !probing {
+		t.Fatal("the in-flight run must be left alone")
+	}
+}
+
+func TestSmartStartPendingProbeDropsProbedMembers(t *testing.T) {
+	s := newTestSmartWithProxies(newFakeProxy("a", 100))
+	s.service = "google-gemini"
+	s.forcePending = map[string]struct{}{"a": {}}
+
+	s.mu.Lock()
+	// The finished run already covered "a", so nothing is left to queue.
+	s.startPendingProbeLocked(s.Proxies(), s.Proxies())
+	s.mu.Unlock()
+
+	if s.forcePending != nil {
+		t.Fatalf("a member the run just probed must be dropped, got %v", s.forcePending)
+	}
+}
+
 func TestSmartRepeatedProbeFailuresDemote(t *testing.T) {
 	s := newTestSmartWithProxies(newFakeProxy("a", 100))
 	s.service = "google-gemini"
@@ -433,7 +607,7 @@ func TestSmartSelectServiceProbeMembers(t *testing.T) {
 	}
 }
 
-func TestSmartSelectServiceProbeMembersBatchCap(t *testing.T) {
+func TestSmartSelectServiceProbeMembersCandidateCap(t *testing.T) {
 	var proxies []C.Proxy
 	for i := 0; i < 40; i++ {
 		proxies = append(proxies, newFakeProxy(fmt.Sprintf("P%02d", i), uint16(100+i*50)))
@@ -446,16 +620,15 @@ func TestSmartSelectServiceProbeMembersBatchCap(t *testing.T) {
 		candidates[fmt.Sprintf("P%02d", i)] = struct{}{}
 	}
 
-	// A bootstrap run is incremental too: it only touches the best-scored
-	// candidates, never the whole roster.
+	// A bootstrap run only touches the best-scored candidates, never the roster.
 	s.mu.Lock()
 	selected, offered := s.selectServiceProbeMembersLocked(s.Proxies(), now)
 	s.mu.Unlock()
 	if offered != serviceProbeCandidates {
 		t.Fatalf("the candidate set must cap at %d, got %d", serviceProbeCandidates, offered)
 	}
-	if len(selected) != serviceProbeBatch {
-		t.Fatalf("a run must cap at %d members, got %d", serviceProbeBatch, len(selected))
+	if len(selected) != serviceProbeCandidates {
+		t.Fatalf("a bootstrap run must probe the whole candidate set, got %v", names(selected))
 	}
 	for _, proxy := range selected {
 		if _, ok := candidates[proxy.Name()]; !ok {
@@ -463,31 +636,28 @@ func TestSmartSelectServiceProbeMembersBatchCap(t *testing.T) {
 		}
 	}
 
-	// The next run continues with the candidates the first one left behind.
-	s.mu.Lock()
-	for _, proxy := range selected {
-		s.verdicts[proxy.Name()] = serviceVerdict{at: now, known: true}
-	}
-	second, _ := s.selectServiceProbeMembersLocked(s.Proxies(), now)
-	s.mu.Unlock()
-	if len(second) != serviceProbeCandidates-serviceProbeBatch {
-		t.Fatalf("the second run must finish the candidates, got %v", names(second))
-	}
-	for _, proxy := range second {
-		if _, ok := candidates[proxy.Name()]; !ok {
-			t.Fatalf("a member outside the candidate set must not be probed: %v", names(second))
-		}
-	}
-
 	// Once every candidate is fresh the roster tail still waits untouched.
 	s.mu.Lock()
-	for _, proxy := range second {
+	for _, proxy := range selected {
 		s.verdicts[proxy.Name()] = serviceVerdict{at: now, known: true}
 	}
 	idle, _ := s.selectServiceProbeMembersLocked(s.Proxies(), now)
 	s.mu.Unlock()
 	if len(idle) != 0 {
 		t.Fatalf("a fresh candidate set must not probe the roster tail, got %v", names(idle))
+	}
+
+	// After the refresh window the candidates return; the tail still never does.
+	s.mu.Lock()
+	stale, _ := s.selectServiceProbeMembersLocked(s.Proxies(), now.Add(serviceVerdictRefresh+time.Second))
+	s.mu.Unlock()
+	if len(stale) != serviceProbeCandidates {
+		t.Fatalf("stale candidates must be re-probed, got %v", names(stale))
+	}
+	for _, proxy := range stale {
+		if _, ok := candidates[proxy.Name()]; !ok {
+			t.Fatalf("a member outside the candidate set must not be probed: %v", names(stale))
+		}
 	}
 }
 

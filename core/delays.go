@@ -270,6 +270,11 @@ func handleAsyncTestDelays(paramsString string, fn func(string)) {
 		delayPushLock.Unlock()
 		results := testDelays(ctx, params)
 		finishDelayBatch(batch)
+		names := make([]string, 0, len(params.Targets))
+		for _, target := range params.Targets {
+			names = append(names, target.Name)
+		}
+		forceServiceProbe(names)
 		delayPushLock.Lock()
 		forcedDelayPush--
 		delayPushLock.Unlock()
