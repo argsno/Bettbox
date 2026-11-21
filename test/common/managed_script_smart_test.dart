@@ -65,14 +65,14 @@ void main() {
     return json.decode(output.readAsStringSync()) as Map<String, dynamic>;
   }
 
-  List<Map> groups(Map<String, dynamic> config) =>
-      (config['proxy-groups'] as List).cast<Map>();
+  List<Map<String, dynamic>> groups(Map<String, dynamic> config) =>
+      (config['proxy-groups'] as List).cast<Map<String, dynamic>>();
 
   List<String> groupTypes(Map<String, dynamic> config) => [
     for (final group in groups(config)) '${group['name']}:${group['type']}',
   ];
 
-  Map group(Map<String, dynamic> config, String name) =>
+  Map<String, dynamic> group(Map<String, dynamic> config, String name) =>
       groups(config).firstWhere((group) => group['name'] == name);
 
   test('smart select is off by default', () async {
