@@ -5,11 +5,12 @@
 #   scripts/build-lite-release.sh              # stable，两个平台
 #   scripts/build-lite-release.sh --env pre     # 预发布通道
 #   scripts/build-lite-release.sh --skip-macos  # 只打 Android
-#   scripts/build-lite-release.sh --no-clean    # 保留 build/，跳过 flutter clean 与 Rust 预热
+#   scripts/build-lite-release.sh --no-clean    # 保留 build/，跳过 flutter clean
 #   scripts/build-lite-release.sh --check       # 只解析工具链并校验已有产物，不构建
 #   scripts/build-lite-release.sh --install     # 校验通过后把 .app 装进 /Applications
 #
 # 工具链可以用环境变量覆盖：FLUTTER_HOME、JAVA_HOME、ANDROID_NDK、ANDROID_SDK_ROOT。
+# 未设置 FLUTTER_HOME 时按仓库 .fvmrc 的版本取 $HOME/fvm/versions/<ver>，再退回 PATH 里的 flutter。
 # 具体命令与踩坑记录见 docs/build-macos.md §3、§5。
 #
 # 兼容 macOS 自带 bash 3.2：不要在这里用关联数组或 `declare -A`。
@@ -36,7 +37,7 @@ usage() {
   --env pre|stable   打包通道，默认 stable
   --skip-macos       只打 Android
   --skip-android     只打 macOS
-  --no-clean         保留 build/，跳过 flutter clean 与 Rust 预热
+  --no-clean         保留 build/，跳过 flutter clean
   --check            只校验 dist/ 里已有的产物，不构建
   --install           把刚校验过的 .app 装进 /Applications；配 --check 可只装不构建
   -h, --help         显示本说明
@@ -81,26 +82,63 @@ java_major() {
   "$1/bin/java" -version 2>&1 | sed -n 's/.*version "\([0-9]*\).*/\1/p' | head -1
 }
 
-resolve_toolchain() {
-  FLUTTER_BIN="${FLUTTER_HOME:-$HOME/fvm/versions/3.47.7}/bin/flutter"
-  if [ ! -x "$FLUTTER_BIN" ]; then
-    FLUTTER_BIN="$(command -v flutter || true)"
-    [ -n "$FLUTTER_BIN" ] ||
-      die "找不到 Flutter SDK：设置 FLUTTER_HOME 指向 3.47.x（3.44.9 的 Dart 解不了 freezed 4，见文档 §3.1）"
+# 优先级：FLUTTER_HOME → 仓库 .fvmrc 的版本 → PATH 里的 flutter；不做版本硬编码兜底。
+resolve_flutter() {
+  local ver
+  if [ -n "${FLUTTER_HOME:-}" ]; then
+    FLUTTER_BIN="$FLUTTER_HOME/bin/flutter"
+    [ -x "$FLUTTER_BIN" ] ||
+      die "FLUTTER_HOME=$FLUTTER_HOME，但 $FLUTTER_BIN 不存在或不可执行"
+    return
   fi
+  if [ -f "$ROOT/.fvmrc" ]; then
+    ver="$(sed -n 's/.*"flutter"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$ROOT/.fvmrc" | head -1)"
+    [ -n "$ver" ] || die "$ROOT/.fvmrc 里读不出 flutter 版本号"
+    FLUTTER_BIN="$HOME/fvm/versions/$ver/bin/flutter"
+    [ -x "$FLUTTER_BIN" ] ||
+      die ".fvmrc 要求 Flutter $ver，但 $FLUTTER_BIN 不存在：先 fvm install $ver，或设置 FLUTTER_HOME"
+    return
+  fi
+  FLUTTER_BIN="$(command -v flutter || true)"
+  [ -n "$FLUTTER_BIN" ] ||
+    die "找不到 Flutter SDK：未设置 FLUTTER_HOME，$ROOT/.fvmrc 不存在，PATH 里也没有 flutter"
+}
+
+# Flutter 持久化的 jdk-dir 优先于 JAVA_HOME 供 AGP 使用，必须单独校验，否则 lint 会崩在旧 JDK 上。
+check_flutter_jdk_dir() {
+  local jdk_dir major
+  jdk_dir="$("$FLUTTER_BIN" config --list 2>/dev/null |
+    sed -n 's/^ *jdk-dir: *\(.*[^ ]\) *$/\1/p' | head -1)"
+  case "$jdk_dir" in
+    ''|'(Not set)'|'Not set') return 0 ;;
+  esac
+  [ -x "$jdk_dir/bin/java" ] ||
+    die "flutter config 的 jdk-dir=$jdk_dir 不是有效 JDK：flutter config --jdk-dir=<JDK 21 路径>"
+  major="$(java_major "$jdk_dir")"
+  [ -n "$major" ] ||
+    die "读不出 flutter config 的 jdk-dir=$jdk_dir 的 Java 版本：flutter config --jdk-dir=<JDK 21 路径>"
+  [ "$major" -ge 21 ] ||
+    die "flutter config 的 jdk-dir 是 Java $major（$jdk_dir），AGP 9.3.1 的 lint 需要 21+；它覆盖 JAVA_HOME，改它：flutter config --jdk-dir=$JAVA_HOME_RESOLVED"
+}
+
+resolve_toolchain() {
+  local candidate major
+  resolve_flutter
   FLUTTER_HOME_RESOLVED="$(cd "$(dirname "$FLUTTER_BIN")/.." && pwd)"
   FLUTTER_VER="$("$FLUTTER_BIN" --version 2>/dev/null | sed -n 's/^Flutter \([0-9.]*\).*/\1/p' | head -1)"
 
   JAVA_HOME_RESOLVED=""
-  for candidate in "${JAVA_HOME:-}" "$HOME/.sdkman/candidates/java/17.0.20-tem" "$(/usr/libexec/java_home -v 17 2>/dev/null || true)"; do
+  for candidate in "${JAVA_HOME:-}" "$(/usr/libexec/java_home -v 21 2>/dev/null || true)" "$HOME"/.sdkman/candidates/java/21*/; do
+    candidate="${candidate%/}"
     [ -n "$candidate" ] || continue
     [ -x "$candidate/bin/java" ] || continue
     major="$(java_major "$candidate")"
     [ -n "$major" ] || continue
-    if [ "$major" -ge 17 ]; then JAVA_HOME_RESOLVED="$candidate"; break; fi
+    if [ "$major" -ge 21 ]; then JAVA_HOME_RESOLVED="$candidate"; break; fi
   done
   [ -n "$JAVA_HOME_RESOLVED" ] ||
-    die "找不到 JDK 17+（AGP 9 / Gradle 9.3 要求）：设置 JAVA_HOME"
+    die "找不到 JDK 21+（AGP 9.3.1 的 lint 依赖 Java 21 API）：设置 JAVA_HOME"
+  check_flutter_jdk_dir
 
   ANDROID_NDK_RESOLVED="${ANDROID_NDK:-}"
   if [ ! -d "$ANDROID_NDK_RESOLVED" ]; then
@@ -132,24 +170,10 @@ print_summary() {
   log "目标      arm64 / lite / $ENV_NAME"
 }
 
-# 绕开 Cargokit 在 Xcode 并行构建下的 E0463（共享中间目录的陈旧指纹），见文档 §3.4。
-warm_rust() {
-  local target_dir=build/macos/Build/Intermediates.noindex/Pods.build/Release/code_forge.build
-  local runner="cargo"
-  command -v rustup >/dev/null 2>&1 && runner="rustup run stable cargo"
-  log "预热 code_forge Rust 产物"
-  rm -rf "$target_dir"
-  $runner build \
-    --manifest-path plugins/code_forge/rust/Cargo.toml \
-    -p code_forge --release \
-    --target aarch64-apple-darwin \
-    --target-dir "$target_dir" >/dev/null
-}
-
 build_platform() {
   local platform="$1"
   log "构建 $platform（arm64 / lite / $ENV_NAME）"
-  dart setup.dart "$platform" --arch arm64 --env "$ENV_NAME" --lite
+  dart setup.dart "$platform" --arch arm64 --env "$ENV_NAME"
 }
 
 # ---------------------------------------------------------------- 产物校验
@@ -165,7 +189,7 @@ build_tools_bin() {
 }
 
 verify_android() {
-  local apk="dist/$APP_NAME-$APP_VERSION-android-lite-arm64-v8a.apk" bt badging native
+  local apk="dist/$APP_NAME-$APP_VERSION-android-arm64-v8a.apk" bt badging native
   [ -f "$apk" ] || die "缺少产物 $apk"
   bt="$(build_tools_bin)" || die "找不到 Android build-tools（apksigner/aapt2）"
 
@@ -182,7 +206,7 @@ $(printf '%s\n' "$badging" | sed -n "1s/.* versionName='\([^']*\)'.*/\1/p") \
 }
 
 verify_macos() {
-  local dmg="dist/$APP_NAME-$APP_VERSION-macos-arm64-lite.dmg" app arch
+  local dmg="dist/$APP_NAME-$APP_VERSION-macos-arm64.dmg" app arch
   [ -f "$dmg" ] || die "缺少产物 $dmg"
   MOUNT_POINT="$(mktemp -d)"
   # hdiutil 在 macOS 27 上会打一条 deprecation 警告到 stderr，这里只保留真正的失败。
@@ -208,7 +232,7 @@ verify_macos() {
 # 把刚校验过的 dmg 里的 .app 装进 /Applications。运行中的实例先发 quit Apple event，
 # 装完如果之前在跑就重新拉起，尽量不打断使用状态。
 install_macos() {
-  local dmg="dist/$APP_NAME-$APP_VERSION-macos-arm64-lite.dmg"
+  local dmg="dist/$APP_NAME-$APP_VERSION-macos-arm64.dmg"
   local dest="/Applications/$APP_NAME.app"
   local was_running=0 i
   [ -f "$dmg" ] || die "缺少产物 $dmg"
@@ -270,10 +294,6 @@ if [ "$DO_CLEAN" = 1 ]; then
   log "flutter pub get"
   "$FLUTTER_BIN" pub get >/dev/null
   # managed.js 的 @version 会在每次打包时自增，这里不去动它；提交时随包一起带上。
-fi
-
-if [ "$DO_MACOS" = 1 ] && [ "$DO_CLEAN" = 1 ]; then
-  warm_rust
 fi
 
 if [ "$DO_MACOS" = 1 ]; then
