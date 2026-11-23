@@ -625,7 +625,7 @@ func TestSmartForcedProbeRecoversOnAnswer(t *testing.T) {
 	}
 }
 
-func TestSmartServicePinYieldsWhileDemoted(t *testing.T) {
+func TestSmartServicePinOutranksDemotion(t *testing.T) {
 	pinned := newFakeProxy("Pinned", 100)
 	confirmed := newFakeProxy("Confirmed", 400)
 	s := newTestSmartWithProxies(pinned, confirmed)
@@ -639,30 +639,28 @@ func TestSmartServicePinYieldsWhileDemoted(t *testing.T) {
 		t.Fatalf("a usable pin must stay first, got %v", names(order))
 	}
 
+	// A manual re-test without a usable verdict demotes the member, but the
+	// lock is the user's choice: routing stays on it until the user unlocks.
 	s.mu.Lock()
 	s.applyProbeOutcomesLocked(map[string]serviceProbeOutcome{"Pinned": {}}, s.Proxies(), now, true)
+	demoted := s.serviceUnusableLocked("Pinned", now)
 	s.mu.Unlock()
 
-	order := s.orderedCandidates(&C.Metadata{Host: "gemini.google.com"}, false)
-	if order[0].Name() != "Confirmed" {
-		t.Fatalf("a demoted pin must yield to the confirmed member, got %v", names(order))
+	if !demoted {
+		t.Fatal("the manual re-test must still record the demotion")
 	}
-	if got := s.Now(); got != "Confirmed" {
-		t.Fatalf("the panel must name the member traffic uses, got %s", got)
+	if order := s.orderedCandidates(&C.Metadata{Host: "gemini.google.com"}, false); order[0].Name() != "Pinned" {
+		t.Fatalf("a locked member must keep the first pick, got %v", names(order))
 	}
-	if got := s.fixedName(); got != "Pinned" {
-		t.Fatalf("the pin must stay recorded, got %q", got)
+	if got := s.Now(); got != "Pinned" {
+		t.Fatalf("the panel must name the locked member, got %s", got)
 	}
 
-	// The demotion lapses with the backoff window, so the pin takes over again
-	// without the user touching it.
-	older := time.Now().Add(-serviceProbeRetryMax - time.Minute)
-	s.mu.Lock()
-	s.attempts["Pinned"] = serviceProbeAttempt{at: older, manual: true, misses: 1}
-	s.mu.Unlock()
-	order = s.orderedCandidates(&C.Metadata{Host: "gemini.google.com"}, false)
-	if order[0].Name() != "Pinned" {
-		t.Fatalf("the pin must come back once the demotion lapses, got %v", names(order))
+	// Unlocking hands the group back to the ranking, where the recorded
+	// demotion now counts against the former pin.
+	s.ForceSet("")
+	if order := s.orderedCandidates(&C.Metadata{Host: "gemini.google.com"}, false); order[0].Name() != "Confirmed" {
+		t.Fatalf("after unlocking the confirmed member must lead, got %v", names(order))
 	}
 }
 

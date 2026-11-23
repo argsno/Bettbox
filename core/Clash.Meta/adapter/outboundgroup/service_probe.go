@@ -743,7 +743,10 @@ func (s *Smart) serviceVerifiedLocked(name string, now time.Time) bool {
 // serviceUnusableLocked reports whether the member should stay out of the
 // preferred pick: the last decidable probe refused it, a manual re-test got no
 // usable verdict from it, or its requests keep failing without producing an
-// answer at all. Callers must hold s.mu.
+// answer at all. A pinned member is the exception: the lock outranks every
+// probe verdict, so the group keeps routing through it until the user unlocks
+// it, and this answer only shapes the ranking the group falls back to.
+// Callers must hold s.mu.
 func (s *Smart) serviceUnusableLocked(name string, now time.Time) bool {
 	if s.service == "" {
 		return false
