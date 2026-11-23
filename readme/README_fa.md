@@ -47,7 +47,7 @@
 * **پشتیبانی دسکتاپ**: 
   * **Windows 8.1+:** (x64 / arm64)
   * **Linux Kernel 5.4+:** (x64 / arm64)
-  * **macOS 12.0+:** (Intel / Apple Silicon)
+  * **macOS 13.0+:** (Intel / Apple Silicon)
 * **موبایل و سایرین**: 
   * **Android 8.0+:** (ARMv8 / ARMv7 / x86_64 / Universal) 
   * **Android TV:** سازگاری کامل با صفحه نمایش‌های بزرگ، نسخه اختیاری ARMv7 32-bit

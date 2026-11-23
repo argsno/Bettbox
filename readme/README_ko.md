@@ -47,7 +47,7 @@ Bettbox는 Better Network Toolbox를 의미합니다. 본 프로젝트는 SignPa
 * **데스크톱 지원**: 
   * **Windows 8.1+:** (x64 / arm64)
   * **Linux Kernel 5.4+:** (x64 / arm64)
-  * **macOS 12.0+:** (Intel / Apple Silicon)
+  * **macOS 13.0+:** (Intel / Apple Silicon)
 * **모바일 및 기타**: 
   * **Android 8.0+:** (ARMv8 / ARMv7 / x86_64 / Universal) 
   * **Android TV:** 대화면 완전 최적화, ARMv7 32비트 버전 선택 가능

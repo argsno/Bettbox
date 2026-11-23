@@ -47,7 +47,7 @@ Bettbox は「Better Network Toolbox」を意味します。本プロジェク�
 * **デスクトップ対応**: 
   * **Windows 8.1+:** (x64 / arm64)
   * **Linux Kernel 5.4+:** (x64 / arm64)
-  * **macOS 12.0+:** (Intel / Apple Silicon)
+  * **macOS 13.0+:** (Intel / Apple Silicon)
 * **モバイルおよびその他**: 
   * **Android 8.0+:** (ARMv8 / ARMv7 / x86_64 / Universal) 
   * **Android TV:** 大画面に完全対応、ARMv7 32ビット版も選択可能

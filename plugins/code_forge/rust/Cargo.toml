@@ -25,3 +25,27 @@ strip = true
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(frb_expand)'] }
+
+# Proc-macro dylibs must not be stripped: with chained fixups (deployment
+# target >= 11) a stripped LINKEDIT string pool can be 8-byte misaligned and
+# dyld refuses to load the dylib (rustc: E0463 "can't find crate").
+[profile.release.package.futures-macro]
+strip = false
+
+[profile.release.package.delegate-attr]
+strip = false
+
+[profile.release.package.flutter_rust_bridge_macros]
+strip = false
+
+[profile.release.package.rquickjs-macro]
+strip = false
+
+[profile.release.package.rustversion]
+strip = false
+
+[profile.release.package.serde_derive]
+strip = false
+
+[profile.release.package.wasm-bindgen-macro]
+strip = false
