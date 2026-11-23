@@ -331,6 +331,7 @@ class MessageLookup extends MessageLookupByLibrary {
     "back": MessageLookupByLibrary.simpleMessage("返回"),
     "backgroundWatermark": MessageLookupByLibrary.simpleMessage("背景水印"),
     "backup": MessageLookupByLibrary.simpleMessage("备份"),
+    "backupAll": MessageLookupByLibrary.simpleMessage("备份所有数据"),
     "backupAndRecovery": MessageLookupByLibrary.simpleMessage("备份与恢复"),
     "backupAndRecoveryDesc": MessageLookupByLibrary.simpleMessage(
       "通过 WebDAV 或本地同步数据",
@@ -347,6 +348,11 @@ class MessageLookup extends MessageLookupByLibrary {
     ),
     "backupPasswordTip": MessageLookupByLibrary.simpleMessage("仅支持英文字母、数字和符号"),
     "backupPasswordWrong": MessageLookupByLibrary.simpleMessage("备份密码错误"),
+    "backupProfiles": MessageLookupByLibrary.simpleMessage("仅备份配置文件"),
+    "backupScopeAllDesc": MessageLookupByLibrary.simpleMessage("配置文件及全部应用设置"),
+    "backupScopeProfilesDesc": MessageLookupByLibrary.simpleMessage(
+      "订阅、覆写脚本、单节点与托管配置",
+    ),
     "backupSuccess": MessageLookupByLibrary.simpleMessage("备份成功"),
     "basicConfig": MessageLookupByLibrary.simpleMessage("内核配置"),
     "basicConfigDesc": MessageLookupByLibrary.simpleMessage("全局修改内核配置"),
@@ -807,7 +813,7 @@ class MessageLookup extends MessageLookupByLibrary {
     "ipLookupProxyExit": MessageLookupByLibrary.simpleMessage("默认节点 IP"),
     "ipLookupResolveFailed": MessageLookupByLibrary.simpleMessage("无法解析该域名"),
     "ipLookupResult": MessageLookupByLibrary.simpleMessage("查询结果"),
-    "ipPrivacyProtection": MessageLookupByLibrary.simpleMessage("隐藏 IP 显示"),
+    "ipPrivacyProtection": MessageLookupByLibrary.simpleMessage("保护 IP 显示"),
     "ipRiskAlert": MessageLookupByLibrary.simpleMessage("IP 风险提示"),
     "ipRiskAmountHigh": MessageLookupByLibrary.simpleMessage("较多"),
     "ipRiskAmountLow": MessageLookupByLibrary.simpleMessage("较少"),

@@ -360,6 +360,7 @@ class MessageLookup extends MessageLookupByLibrary {
     "back": MessageLookupByLibrary.simpleMessage("戻る"),
     "backgroundWatermark": MessageLookupByLibrary.simpleMessage("背景ウォーターマーク"),
     "backup": MessageLookupByLibrary.simpleMessage("バックアップ"),
+    "backupAll": MessageLookupByLibrary.simpleMessage("すべてのデータをバックアップ"),
     "backupAndRecovery": MessageLookupByLibrary.simpleMessage("バックアップと復元"),
     "backupAndRecoveryDesc": MessageLookupByLibrary.simpleMessage(
       "WebDAVまたはローカルでデータを同期",
@@ -379,6 +380,13 @@ class MessageLookup extends MessageLookupByLibrary {
     ),
     "backupPasswordWrong": MessageLookupByLibrary.simpleMessage(
       "バックアップパスワードが正しくありません",
+    ),
+    "backupProfiles": MessageLookupByLibrary.simpleMessage("プロファイルのみバックアップ"),
+    "backupScopeAllDesc": MessageLookupByLibrary.simpleMessage(
+      "プロファイルとすべてのアプリ設定",
+    ),
+    "backupScopeProfilesDesc": MessageLookupByLibrary.simpleMessage(
+      "サブスクリプション、オーバーライドスクリプト、ノード、マネージドモード",
     ),
     "backupSuccess": MessageLookupByLibrary.simpleMessage("バックアップ成功"),
     "basicConfig": MessageLookupByLibrary.simpleMessage("カーネル設定"),
@@ -906,7 +914,7 @@ class MessageLookup extends MessageLookupByLibrary {
       "このドメインを解決できません",
     ),
     "ipLookupResult": MessageLookupByLibrary.simpleMessage("検索結果"),
-    "ipPrivacyProtection": MessageLookupByLibrary.simpleMessage("IP表示を隠す"),
+    "ipPrivacyProtection": MessageLookupByLibrary.simpleMessage("IP表示を保護"),
     "ipRiskAlert": MessageLookupByLibrary.simpleMessage("IP リスク警告"),
     "ipRiskAmountHigh": MessageLookupByLibrary.simpleMessage("多い"),
     "ipRiskAmountLow": MessageLookupByLibrary.simpleMessage("少ない"),

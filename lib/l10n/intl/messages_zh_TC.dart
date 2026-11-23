@@ -333,6 +333,7 @@ class MessageLookup extends MessageLookupByLibrary {
     "back": MessageLookupByLibrary.simpleMessage("返回"),
     "backgroundWatermark": MessageLookupByLibrary.simpleMessage("背景浮水印"),
     "backup": MessageLookupByLibrary.simpleMessage("備份"),
+    "backupAll": MessageLookupByLibrary.simpleMessage("備份所有資料"),
     "backupAndRecovery": MessageLookupByLibrary.simpleMessage("備份與還原"),
     "backupAndRecoveryDesc": MessageLookupByLibrary.simpleMessage(
       "透過 WebDAV 或本地同步資料",
@@ -349,6 +350,11 @@ class MessageLookup extends MessageLookupByLibrary {
     ),
     "backupPasswordTip": MessageLookupByLibrary.simpleMessage("僅支援英文字母、數字和符號"),
     "backupPasswordWrong": MessageLookupByLibrary.simpleMessage("備份密碼錯誤"),
+    "backupProfiles": MessageLookupByLibrary.simpleMessage("僅備份設定檔"),
+    "backupScopeAllDesc": MessageLookupByLibrary.simpleMessage("設定檔及全部應用程式設定"),
+    "backupScopeProfilesDesc": MessageLookupByLibrary.simpleMessage(
+      "訂閱、覆寫腳本、單節點與託管設定",
+    ),
     "backupSuccess": MessageLookupByLibrary.simpleMessage("備份成功"),
     "basicConfig": MessageLookupByLibrary.simpleMessage("內核配置"),
     "basicConfigDesc": MessageLookupByLibrary.simpleMessage("全域修改內核配置"),
@@ -813,7 +819,7 @@ class MessageLookup extends MessageLookupByLibrary {
     "ipLookupProxyExit": MessageLookupByLibrary.simpleMessage("預設節點 IP"),
     "ipLookupResolveFailed": MessageLookupByLibrary.simpleMessage("無法解析該網域"),
     "ipLookupResult": MessageLookupByLibrary.simpleMessage("查詢結果"),
-    "ipPrivacyProtection": MessageLookupByLibrary.simpleMessage("隱藏 IP 顯示"),
+    "ipPrivacyProtection": MessageLookupByLibrary.simpleMessage("保護 IP 顯示"),
     "ipRiskAlert": MessageLookupByLibrary.simpleMessage("IP 風險提示"),
     "ipRiskAmountHigh": MessageLookupByLibrary.simpleMessage("較多"),
     "ipRiskAmountLow": MessageLookupByLibrary.simpleMessage("較少"),

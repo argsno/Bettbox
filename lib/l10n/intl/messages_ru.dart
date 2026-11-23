@@ -437,6 +437,7 @@ class MessageLookup extends MessageLookupByLibrary {
       "Фоновый водяной знак",
     ),
     "backup": MessageLookupByLibrary.simpleMessage("Создать копию"),
+    "backupAll": MessageLookupByLibrary.simpleMessage("Все данные"),
     "backupAndRecovery": MessageLookupByLibrary.simpleMessage(
       "Резервное копирование",
     ),
@@ -460,6 +461,13 @@ class MessageLookup extends MessageLookupByLibrary {
     ),
     "backupPasswordWrong": MessageLookupByLibrary.simpleMessage(
       "Неверный пароль резервной копии",
+    ),
+    "backupProfiles": MessageLookupByLibrary.simpleMessage("Только профили"),
+    "backupScopeAllDesc": MessageLookupByLibrary.simpleMessage(
+      "Профили и все настройки приложения",
+    ),
+    "backupScopeProfilesDesc": MessageLookupByLibrary.simpleMessage(
+      "Подписки, скрипты переопределения, узлы и управляемый режим",
     ),
     "backupSuccess": MessageLookupByLibrary.simpleMessage(
       "Резервное копирование успешно",
@@ -1121,7 +1129,9 @@ class MessageLookup extends MessageLookupByLibrary {
       "Не удалось разрешить домен",
     ),
     "ipLookupResult": MessageLookupByLibrary.simpleMessage("Результаты"),
-    "ipPrivacyProtection": MessageLookupByLibrary.simpleMessage("Скрыть IP"),
+    "ipPrivacyProtection": MessageLookupByLibrary.simpleMessage(
+      "Защита показа IP",
+    ),
     "ipRiskAlert": MessageLookupByLibrary.simpleMessage(
       "Предупреждение о риске IP",
     ),

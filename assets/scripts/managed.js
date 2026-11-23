@@ -4,7 +4,7 @@
  * 自定义分流远程规则集：@appshubcc https://github.com/appshubcc/bett-rules 
  */
 
-// @version 2026112201
+// @version 2026112301
 const Compatible_With_Bettbox = { ruleOptionsEnable: true };
 
 const ruleOptionsEnable = {
@@ -1162,21 +1162,41 @@ function buildCustomServices(reservedNames) {
 /**
  * 按用户保存的策略组顺序排序，未在顺序中的策略组紧随前一项之后
  */
-function sortByGroupOrder(services) {
-  if (!groupOrder.length) return services;
+const groupOrderKeys = (() => {
+  if (!groupOrder.length) return null;
+
+  const names = serviceConfigs.map((svc) => svc.name);
+  const anchorIndex = names.indexOf('AdBlock');
+  names.splice(anchorIndex < 0 ? names.length : anchorIndex, 0, ...customRoutes.map((route) => route?.name));
+  names.push('直连', ...allRegionDefinitions.map((region) => region.name), '其他节点');
 
   const rank = new Map(groupOrder.map((name, index) => [name, index]));
+  const keys = new Map();
   let last = -1;
+  names.forEach((name, index) => {
+    const order = rank.get(name);
+    if (order !== undefined) last = order;
+    if (typeof name === 'string' && !keys.has(name)) keys.set(name, [order ?? last + 0.5, index]);
+  });
+  return keys;
+})();
+
+function sortByGroupOrder(services) {
+  if (!groupOrderKeys) return services;
+
+  const keyOf = (svc) => {
+    // 分流项派生的 smart 子组必须排在父组之前，否则内核解析父组时找不到它；
+    // 用户保存的顺序里可能正好有同名项，因此按父组名取顺序而不是按自身名。
+    const name = svc.service ? svc.name.replace(/-智能选择$/, '') : svc.name;
+    return (
+      groupOrderKeys.get(name) ??
+      groupOrderKeys.get(name.replace(/-(?:自动选择|智能选择)$/, '')) ??
+      [Infinity, Infinity]
+    );
+  };
   return services
-    .map((svc, index) => {
-      // 分流项派生的 smart 子组必须排在父组之前，否则内核解析父组时找不到它；
-      // 用户保存的顺序里可能正好有同名项，因此按父组名取顺序而不是按自身名。
-      const orderName = svc.service ? svc.name.replace(/-智能选择$/, '') : svc.name;
-      const order = rank.get(orderName) ?? rank.get(orderName.replace(/-(?:自动选择|智能选择)$/, ''));
-      if (order !== undefined) last = order;
-      return { svc, index, key: order !== undefined ? order : last + 0.5 };
-    })
-    .sort((a, b) => a.key - b.key || a.index - b.index)
+    .map((svc, index) => ({ svc, index, key: keyOf(svc) }))
+    .sort((a, b) => a.key[0] - b.key[0] || a.key[1] - b.key[1] || a.index - b.index)
     .map((entry) => entry.svc);
 }
 

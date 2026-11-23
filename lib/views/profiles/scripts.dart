@@ -160,19 +160,11 @@ class _ScriptsViewState extends ConsumerState<ScriptsView> {
     if (res != true) {
       return;
     }
-    final id = ref
-        .read(scriptStateProvider)
-        .scripts
-        .where((script) => script.label == label)
-        .firstOrNull
-        ?.id;
-    ref.read(scriptStateProvider.notifier).del(label);
-    if (id == null) return;
-    final profiles = ref.read(profilesProvider.notifier);
-    for (final profile in ref.read(profilesProvider)) {
-      if (profile.scriptId != id) continue;
-      profiles.updateProfile(profile.id, (p) => p.copyWith(scriptId: null));
-    }
+    await globalState.appController.safeRun(
+      () => globalState.appController.deleteScript(label),
+      needLoading: true,
+      silence: false,
+    );
   }
 
   Future<void> _handleSyncScript(String id) async {
@@ -818,6 +810,19 @@ class _ScriptSettingsSheet extends ConsumerWidget {
 
   void _handleChanged(WidgetRef ref, Profile profile, String? value) {
     if (value == null) return;
+    if (profile.bundle != null) {
+      final appController = globalState.appController;
+      unawaited(
+        appController.safeRun(
+          () => appController.updateBundleScript(
+            profile.id,
+            value == managedScriptId ? null : value,
+          ),
+          silence: false,
+        ),
+      );
+      return;
+    }
     ref
         .read(profilesProvider.notifier)
         .updateProfile(
@@ -835,11 +840,11 @@ class _ScriptSettingsSheet extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final profiles = ref.watch(profilesProvider);
     final props = ref.watch(scriptStateProvider);
-    final options = [
+    final bundleOptions = [
       managedScriptId,
       for (final script in props.scripts) script.id,
-      _noScript,
     ];
+    final options = [...bundleOptions, _noScript];
     return AdaptiveSheetScaffold(
       type: type,
       body: profiles.isEmpty
@@ -867,24 +872,21 @@ class _ScriptSettingsSheet extends ConsumerWidget {
                     child: CommonCard(
                       elevated: false,
                       type: CommonCardType.filled,
-                      child: profile.bundle != null
-                          ? ListItem(
-                              title: EmojiText(label),
-                              subtitle: subtitle,
-                            )
-                          : ListItem<String>.options(
-                              title: EmojiText(label),
-                              subtitle: subtitle,
-                              trailing: const AppIcon(Icons.expand_more),
-                              delegate: OptionsDelegate(
-                                title: label,
-                                options: options,
-                                value: value,
-                                textBuilder: (value) => _labelOf(value, props),
-                                onChanged: (value) =>
-                                    _handleChanged(ref, profile, value),
-                              ),
-                            ),
+                      child: ListItem<String>.options(
+                        title: EmojiText(label),
+                        subtitle: subtitle,
+                        trailing: const AppIcon(Icons.expand_more),
+                        delegate: OptionsDelegate(
+                          title: label,
+                          options: profile.bundle != null
+                              ? bundleOptions
+                              : options,
+                          value: value,
+                          textBuilder: (value) => _labelOf(value, props),
+                          onChanged: (value) =>
+                              _handleChanged(ref, profile, value),
+                        ),
+                      ),
                     ),
                   );
                 },
