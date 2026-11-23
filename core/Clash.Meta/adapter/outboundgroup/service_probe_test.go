@@ -295,7 +295,7 @@ func TestSmartApplyProbeOutcomes(t *testing.T) {
 		"a": {done: true, verdict: serviceVerdict{at: now}},
 		// A failed request records the attempt without touching the verdict.
 		"b": {},
-	}, s.Proxies(), now)
+	}, s.Proxies(), now, false)
 	blockedA := s.serviceUnusableLocked("a", now)
 	attemptA := s.attempts["a"]
 	attemptB := s.attempts["b"]
@@ -318,7 +318,7 @@ func TestSmartApplyProbeOutcomes(t *testing.T) {
 	s.applyProbeOutcomesLocked(map[string]serviceProbeOutcome{
 		"a": {done: true, verdict: serviceVerdict{at: now, known: true}},
 		"b": {done: true, verdict: serviceVerdict{at: now, known: true, blocked: true}},
-	}, s.Proxies(), now)
+	}, s.Proxies(), now, false)
 	clearedA := s.serviceUnusableLocked("a", now)
 	blockedB := s.serviceUnusableLocked("b", now)
 	missesA := s.attempts["a"].misses
@@ -350,7 +350,7 @@ func TestSmartApplyProbeOutcomesPrunesGoneMembers(t *testing.T) {
 	s.mu.Lock()
 	s.applyProbeOutcomesLocked(map[string]serviceProbeOutcome{
 		"ghost": {done: true, verdict: serviceVerdict{at: now, known: true}},
-	}, s.Proxies(), now)
+	}, s.Proxies(), now, false)
 	s.mu.Unlock()
 
 	if _, ok := s.verdicts["ghost"]; ok {
@@ -521,7 +521,7 @@ func TestSmartRepeatedProbeFailuresDemote(t *testing.T) {
 
 	s.mu.Lock()
 	for i := 0; i < serviceProbeFailLimit; i++ {
-		s.applyProbeOutcomesLocked(map[string]serviceProbeOutcome{"a": {}}, s.Proxies(), now)
+		s.applyProbeOutcomesLocked(map[string]serviceProbeOutcome{"a": {}}, s.Proxies(), now, false)
 	}
 	demoted := s.serviceUnusableLocked("a", now)
 	attempt := s.attempts["a"]
@@ -537,7 +537,7 @@ func TestSmartRepeatedProbeFailuresDemote(t *testing.T) {
 	// A response, even an undecidable one, proves the egress reaches the
 	// service and clears the failure streak on the next run.
 	s.mu.Lock()
-	s.applyProbeOutcomesLocked(map[string]serviceProbeOutcome{"a": {done: true}}, s.Proxies(), now)
+	s.applyProbeOutcomesLocked(map[string]serviceProbeOutcome{"a": {done: true}}, s.Proxies(), now, false)
 	recovered := !s.serviceUnusableLocked("a", now)
 	fails := s.attempts["a"].fails
 	s.mu.Unlock()
@@ -546,6 +546,123 @@ func TestSmartRepeatedProbeFailuresDemote(t *testing.T) {
 	}
 	if fails != 0 {
 		t.Fatalf("an answered probe must reset the failure streak, got %d", fails)
+	}
+}
+
+func TestSmartForcedProbeDemotesImmediately(t *testing.T) {
+	failed := newFakeProxy("failed", 100)
+	silent := newFakeProxy("silent", 200)
+	s := newTestSmartWithProxies(failed, silent)
+	s.service = "google-gemini"
+	now := time.Now()
+	s.verdicts["failed"] = serviceVerdict{at: now, known: true}
+	s.verdicts["silent"] = serviceVerdict{at: now, known: true}
+
+	s.mu.Lock()
+	s.applyProbeOutcomesLocked(map[string]serviceProbeOutcome{
+		// A manual re-test that never reached the service.
+		"failed": {},
+		// A manual re-test that answered but produced no verdict (429/5xx).
+		"silent": {done: true, verdict: serviceVerdict{at: now}},
+	}, s.Proxies(), now, true)
+	failedDemoted := s.serviceUnusableLocked("failed", now)
+	silentDemoted := s.serviceUnusableLocked("silent", now)
+	failedConfirmed := s.serviceVerifiedLocked("failed", now)
+	silentConfirmed := s.serviceVerifiedLocked("silent", now)
+	s.mu.Unlock()
+
+	if !failedDemoted || !silentDemoted {
+		t.Fatalf("one manual re-test without a usable verdict must demote, got %+v and %+v",
+			s.attempts["failed"], s.attempts["silent"])
+	}
+	if failedConfirmed || silentConfirmed {
+		t.Fatal("a manual re-test without a usable verdict must drop the confirmation")
+	}
+}
+
+func TestSmartBackgroundProbeKeepsFailLimit(t *testing.T) {
+	s := newTestSmartWithProxies(newFakeProxy("a", 100))
+	s.service = "google-gemini"
+	now := time.Now()
+
+	s.mu.Lock()
+	s.applyProbeOutcomesLocked(map[string]serviceProbeOutcome{
+		"a": {done: true, verdict: serviceVerdict{at: now}},
+	}, s.Proxies(), now, false)
+	demoted := s.serviceUnusableLocked("a", now)
+	s.mu.Unlock()
+
+	// A background run still needs the failure streak: one transient reset
+	// must not cost the member its place.
+	if demoted {
+		t.Fatal("a single background probe without a verdict must not demote")
+	}
+}
+
+func TestSmartForcedProbeRecoversOnAnswer(t *testing.T) {
+	s := newTestSmartWithProxies(newFakeProxy("a", 100))
+	s.service = "google-gemini"
+	now := time.Now()
+
+	s.mu.Lock()
+	s.applyProbeOutcomesLocked(map[string]serviceProbeOutcome{"a": {}}, s.Proxies(), now, true)
+	s.applyProbeOutcomesLocked(map[string]serviceProbeOutcome{
+		"a": {done: true, verdict: serviceVerdict{at: now, known: true}},
+	}, s.Proxies(), now, true)
+	demoted := s.serviceUnusableLocked("a", now)
+	confirmed := s.serviceVerifiedLocked("a", now)
+	attempt := s.attempts["a"]
+	s.mu.Unlock()
+
+	if demoted {
+		t.Fatal("an answered manual re-test must lift the demotion")
+	}
+	if !confirmed {
+		t.Fatal("an answered manual re-test must confirm the member again")
+	}
+	if attempt.manual || attempt.fails != 0 || attempt.misses != 0 {
+		t.Fatalf("an answered probe must clear every streak, got %+v", attempt)
+	}
+}
+
+func TestSmartServicePinYieldsWhileDemoted(t *testing.T) {
+	pinned := newFakeProxy("Pinned", 100)
+	confirmed := newFakeProxy("Confirmed", 400)
+	s := newTestSmartWithProxies(pinned, confirmed)
+	s.service = "google-gemini"
+	now := time.Now()
+	s.verdicts["Confirmed"] = serviceVerdict{at: now, known: true}
+	s.ForceSet("Pinned")
+	s.lastProbe = now
+
+	if order := s.orderedCandidates(&C.Metadata{Host: "gemini.google.com"}, false); order[0].Name() != "Pinned" {
+		t.Fatalf("a usable pin must stay first, got %v", names(order))
+	}
+
+	s.mu.Lock()
+	s.applyProbeOutcomesLocked(map[string]serviceProbeOutcome{"Pinned": {}}, s.Proxies(), now, true)
+	s.mu.Unlock()
+
+	order := s.orderedCandidates(&C.Metadata{Host: "gemini.google.com"}, false)
+	if order[0].Name() != "Confirmed" {
+		t.Fatalf("a demoted pin must yield to the confirmed member, got %v", names(order))
+	}
+	if got := s.Now(); got != "Confirmed" {
+		t.Fatalf("the panel must name the member traffic uses, got %s", got)
+	}
+	if got := s.fixedName(); got != "Pinned" {
+		t.Fatalf("the pin must stay recorded, got %q", got)
+	}
+
+	// The demotion lapses with the backoff window, so the pin takes over again
+	// without the user touching it.
+	older := time.Now().Add(-serviceProbeRetryMax - time.Minute)
+	s.mu.Lock()
+	s.attempts["Pinned"] = serviceProbeAttempt{at: older, manual: true, misses: 1}
+	s.mu.Unlock()
+	order = s.orderedCandidates(&C.Metadata{Host: "gemini.google.com"}, false)
+	if order[0].Name() != "Pinned" {
+		t.Fatalf("the pin must come back once the demotion lapses, got %v", names(order))
 	}
 }
 

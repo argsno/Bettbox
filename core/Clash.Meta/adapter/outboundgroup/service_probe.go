@@ -247,11 +247,20 @@ type serviceProbeOutcome struct {
 // misses counts the consecutive tries that produced no decidable answer and
 // drives the exponential backoff; a decidable answer resets it. fails counts
 // the consecutive tries whose request never completed at all: a response, even
-// an undecidable one, proves the member can reach the service.
+// an undecidable one, proves the member can reach the service. manual marks a
+// demotion a forced re-test produced, where a single try without a usable
+// verdict is already the answer the user asked for.
 type serviceProbeAttempt struct {
 	at     time.Time
 	misses int
 	fails  int
+	manual bool
+}
+
+// demoted reports whether the attempt alone keeps the member out of the
+// preferred pick, before the lapse window is applied.
+func (a serviceProbeAttempt) demoted() bool {
+	return a.manual || a.fails >= serviceProbeFailLimit
 }
 
 // backoff doubles serviceProbeRetry per consecutive miss, capped at
@@ -499,7 +508,7 @@ func (s *Smart) maybeProbeService(proxies []C.Proxy) {
 	}
 	log.Debugln("[Smart] %s: probing %d of %d candidates (%d members) for service %s",
 		s.Name(), len(selected), candidates, len(proxies), s.service)
-	s.startServiceProbeLocked(selected, proxies)
+	s.startServiceProbeLocked(selected, proxies, false)
 	s.mu.Unlock()
 }
 
@@ -539,7 +548,7 @@ func (s *Smart) ForceServiceProbe(names []string) {
 		return
 	}
 	log.Debugln("[Smart] %s: force probing %d member(s) for service %s", s.Name(), len(targets), s.service)
-	s.startServiceProbeLocked(targets, proxies)
+	s.startServiceProbeLocked(targets, proxies, true)
 	s.mu.Unlock()
 }
 
@@ -601,15 +610,16 @@ func (s *Smart) forceProbeTargetsLocked(proxies []C.Proxy, names []string, curre
 
 // startServiceProbeLocked starts one probe run over targets. members is the
 // full member list, so outcomes for members that left the group are pruned.
-// Callers must hold s.mu.
-func (s *Smart) startServiceProbeLocked(targets, members []C.Proxy) {
+// forced marks a run a manual re-test triggered, where a member without a
+// usable verdict is demoted on that one try. Callers must hold s.mu.
+func (s *Smart) startServiceProbeLocked(targets, members []C.Proxy, forced bool) {
 	s.probing = true
 	s.lastProbe = time.Now()
 	go func() {
 		outcomes := s.probeServiceMembers(targets, s.service)
 		s.mu.Lock()
 		s.probing = false
-		s.applyProbeOutcomesLocked(outcomes, members, time.Now())
+		s.applyProbeOutcomesLocked(outcomes, members, time.Now(), forced)
 		s.invalidateRankCacheLocked()
 		s.startPendingProbeLocked(members, targets)
 		s.mu.Unlock()
@@ -642,7 +652,7 @@ func (s *Smart) startPendingProbeLocked(members, probed []C.Proxy) {
 		return
 	}
 	log.Debugln("[Smart] %s: force probing %d queued member(s) for service %s", s.Name(), len(targets), s.service)
-	s.startServiceProbeLocked(targets, members)
+	s.startServiceProbeLocked(targets, members, true)
 }
 
 // applyProbeOutcomesLocked records one run's results: a known verdict replaces
@@ -651,9 +661,12 @@ func (s *Smart) startPendingProbeLocked(members, probed []C.Proxy) {
 // the member is not retried immediately. Repeated unanswered requests are the
 // exception: they demote the member until it answers again, because an egress
 // that keeps resetting the service is unusable even when no probe ever decided
-// about it. Verdicts of members that left the group are dropped instead of
-// lingering forever. Callers must hold s.mu.
-func (s *Smart) applyProbeOutcomesLocked(outcomes map[string]serviceProbeOutcome, members []C.Proxy, now time.Time) {
+// about it. A forced run is the user asking about that member, so one try
+// without a usable verdict demotes it too, and the group can move to a
+// confirmed member without waiting for the failure streak. Verdicts of members
+// that left the group are dropped instead of lingering forever. Callers must
+// hold s.mu.
+func (s *Smart) applyProbeOutcomesLocked(outcomes map[string]serviceProbeOutcome, members []C.Proxy, now time.Time, forced bool) {
 	current := make(map[string]struct{}, len(members))
 	for _, proxy := range members {
 		if proxy != nil {
@@ -665,26 +678,32 @@ func (s *Smart) applyProbeOutcomesLocked(outcomes map[string]serviceProbeOutcome
 			s.attempts = make(map[string]serviceProbeAttempt, len(outcomes))
 		}
 		previous := s.attempts[name]
+		usable := outcome.done && outcome.verdict.known
 		attempt := serviceProbeAttempt{at: now}
 		if !outcome.done {
 			attempt.fails = previous.fails + 1
 		}
-		if !(outcome.done && outcome.verdict.known) {
+		if !usable {
 			attempt.misses = previous.misses + 1
+			attempt.manual = forced
 		}
 		s.attempts[name] = attempt
-		if outcome.done && outcome.verdict.known {
+		if usable {
 			if s.verdicts == nil {
 				s.verdicts = make(map[string]serviceVerdict, len(outcomes))
 			}
 			s.verdicts[name] = outcome.verdict
 		}
 		// Only the transitions are logged: every failed attempt is already logged
-		// by the probe itself, and the threshold is what changes the routing.
-		if previous.fails < serviceProbeFailLimit && attempt.fails >= serviceProbeFailLimit {
+		// by the probe itself, and the demotion is what changes the routing.
+		switch {
+		case attempt.demoted() && !previous.demoted() && attempt.manual:
+			log.Debugln("[Smart] service %s via %s: manual re-test without a usable verdict, demoted",
+				s.service, name)
+		case attempt.demoted() && !previous.demoted():
 			log.Debugln("[Smart] service %s via %s: %d probes without an answer, demoted",
 				s.service, name, attempt.fails)
-		} else if previous.fails >= serviceProbeFailLimit && attempt.fails == 0 {
+		case !attempt.demoted() && previous.demoted():
 			log.Debugln("[Smart] service %s via %s: probe answered again, usable", s.service, name)
 		}
 	}
@@ -712,18 +731,19 @@ func (s *Smart) serviceVerifiedLocked(name string, now time.Time) bool {
 	if !ok || !verdict.known || verdict.blocked || now.Sub(verdict.at) > serviceVerdictTTL {
 		return false
 	}
-	// A request that failed after the verdict means the member can no longer be
-	// confirmed even before the failure streak crosses the demotion limit; the
-	// next answered probe re-confirms it.
-	if attempt, ok := s.attempts[name]; ok && attempt.fails > 0 {
+	// A request that failed or a forced re-test that produced no usable verdict
+	// means the member can no longer be confirmed even before the failure streak
+	// crosses the demotion limit; the next answered probe re-confirms it.
+	if attempt, ok := s.attempts[name]; ok && (attempt.fails > 0 || attempt.manual) {
 		return false
 	}
 	return true
 }
 
 // serviceUnusableLocked reports whether the member should stay out of the
-// preferred pick: the last decidable probe refused it, or its requests keep
-// failing without producing an answer at all. Callers must hold s.mu.
+// preferred pick: the last decidable probe refused it, a manual re-test got no
+// usable verdict from it, or its requests keep failing without producing an
+// answer at all. Callers must hold s.mu.
 func (s *Smart) serviceUnusableLocked(name string, now time.Time) bool {
 	if s.service == "" {
 		return false
@@ -732,7 +752,7 @@ func (s *Smart) serviceUnusableLocked(name string, now time.Time) bool {
 	// probe ever produced a verdict: an allowed answer that is minutes or hours
 	// old must not be the only reason to keep routing there. The demotion lapses
 	// with the backoff window, so the member is re-tried and can recover.
-	if attempt, ok := s.attempts[name]; ok && attempt.fails >= serviceProbeFailLimit && now.Sub(attempt.at) < attempt.backoff() {
+	if attempt, ok := s.attempts[name]; ok && attempt.demoted() && now.Sub(attempt.at) < attempt.backoff() {
 		return true
 	}
 	verdict, ok := s.verdicts[name]

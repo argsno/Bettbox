@@ -263,8 +263,9 @@ type Smart struct {
 // policy every new connection will use.
 func (s *Smart) Now() string {
 	proxies := s.GetProxies(false)
+	now := time.Now()
 
-	if selected := s.fixedName(); selected != "" {
+	if selected := s.effectivePin(now); selected != "" {
 		for _, proxy := range proxies {
 			if proxy.Name() == selected {
 				return selected
@@ -275,12 +276,10 @@ func (s *Smart) Now() string {
 	// A service group fixes on one member for everything, so the panel must
 	// name that member, not the best-scored or most-used one.
 	if s.serviceGroupPin() {
-		if item := s.servicePick(proxies, time.Now()); item != nil {
+		if item := s.servicePick(proxies, now); item != nil {
 			return item.proxy.Name()
 		}
 	}
-
-	now := time.Now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	bestName := ""
@@ -545,7 +544,7 @@ func (s *Smart) representativeProxy(metadata *C.Metadata, touch bool) C.Proxy {
 	}
 
 	s.mu.Lock()
-	pinned := s.selected
+	pinned := s.effectivePinLocked(now)
 	s.mu.Unlock()
 
 	if pinned != "" {
@@ -592,6 +591,26 @@ func (s *Smart) MarshalJSON() ([]byte, error) {
 func (s *Smart) fixedName() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.selected
+}
+
+// effectivePin returns the pinned member while the group may still route
+// through it. A service group drops the pin while the member cannot serve the
+// service, so the reported pick is the member traffic actually uses; the pin
+// stays recorded and takes over again once the member recovers.
+func (s *Smart) effectivePin(now time.Time) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.effectivePinLocked(now)
+}
+
+func (s *Smart) effectivePinLocked(now time.Time) string {
+	if s.selected == "" {
+		return ""
+	}
+	if s.service != "" && s.serviceUnusableLocked(s.selected, now) {
+		return ""
+	}
 	return s.selected
 }
 
@@ -830,10 +849,11 @@ func (s *Smart) rankedCandidates(proxies []C.Proxy, now time.Time) []smartCandid
 }
 
 // orderedCandidates returns the policies to try for one request: the preferred
-// pick first (a random member of the policies closest to the best score, or
-// the pinned one), then the remaining healthy policies by score, then the ones
-// a service probe demoted, then the failed ones, so a dead connection can fall
-// back to the next candidate.
+// pick first (the pinned member while it can serve the group, a random member
+// of the policies closest to the best score, or the pinned one for a plain
+// group), then the remaining healthy policies by score, then the ones a service
+// probe demoted, then the failed ones, so a dead connection can fall back to
+// the next candidate.
 func (s *Smart) orderedCandidates(metadata *C.Metadata, touch bool) []C.Proxy {
 	proxies := s.GetProxies(touch)
 	if len(proxies) == 0 {
@@ -863,7 +883,7 @@ func (s *Smart) orderedCandidates(metadata *C.Metadata, touch bool) []C.Proxy {
 			}
 		}
 	}
-	pinned := s.selected
+	pinned := s.effectivePinLocked(now)
 	s.mu.Unlock()
 
 	firstPick := -1
