@@ -39,11 +39,6 @@ String _targetLabel(String target) =>
 String _searchKey(String value) =>
     value.toLowerCase().replaceAll(_searchKeyPattern, '');
 
-final _sensitiveTagPattern = RegExp(
-  r'porn|hentai|xvideos|xnxx|missav|javdb|jable|mindgeek|onlyfans|category-adult|category-gambling|casino|betting',
-  caseSensitive: false,
-);
-
 String _iconName(String icon) {
   final name = icon.substring(icon.lastIndexOf('/') + 1);
   return name.endsWith('.svg') ? name.substring(0, name.length - 4) : name;
@@ -329,7 +324,11 @@ class _ManagedOptionsSheetState extends ConsumerState<ManagedOptionsSheet> {
             key,
       ];
       _options = options;
-      _icons = icons;
+      _icons = {
+        for (final MapEntry(:key, :value) in managedRateGroupIcons.entries)
+          key: ?routeIconUrl(value),
+        ...icons,
+      };
       _regions = managedRegions(
         data.catalog.catalog,
         _enabledRegions,
@@ -348,6 +347,8 @@ class _ManagedOptionsSheetState extends ConsumerState<ManagedOptionsSheet> {
     });
   }
 
+  List<String> get _rateGroups => managedRateGroups(_options);
+
   List<String> _arrange(List<String> saved) => orderManagedGroups(
     presets: [
       for (final name in _presets)
@@ -355,7 +356,7 @@ class _ManagedOptionsSheetState extends ConsumerState<ManagedOptionsSheet> {
     ],
     customs: [for (final route in _routes) route.name],
     saved: saved,
-    regions: _regions,
+    regions: [..._regions, ..._rateGroups],
   );
 
   void _change(VoidCallback callback) {
@@ -492,6 +493,7 @@ class _ManagedOptionsSheetState extends ConsumerState<ManagedOptionsSheet> {
             _options['禁用内核QUIC流量'] ??= _options['屏蔽内核QUIC流量']!;
             _options.remove('屏蔽内核QUIC流量');
           }
+          _order = _arrange(_order);
           _persist();
         });
       },
@@ -641,11 +643,12 @@ class _ManagedOptionsSheetState extends ConsumerState<ManagedOptionsSheet> {
       );
     }
     final routes = {for (final route in _routes) route.name: route};
+    final hidden = {..._regions, ..._rateGroups};
     final items = _sorting
         ? _order
         : [
             for (final name in _order)
-              if (!_regions.contains(name)) name,
+              if (!hidden.contains(name)) name,
           ];
     final regions = catalog.catalog.regions;
     return ReorderableListView.builder(
@@ -1206,7 +1209,18 @@ class _RouteSheetState extends State<_RouteSheet> {
     ],
   );
 
-  List<RouteService> get _services => _serviceIndex.search(_query);
+  List<RouteService> get _services {
+    final searched = _serviceIndex.search(_query);
+    if (_query.trim().isNotEmpty) return searched;
+    return [
+      for (final service in searched)
+        if (_routeOf.containsKey(service.name) ||
+            _added.contains(service) ||
+            (!sensitiveRoutePattern.hasMatch(service.name) &&
+                !service.sets.any(sensitiveRoutePattern.hasMatch)))
+          service,
+    ];
+  }
 
   bool _available(RouteService service) =>
       !widget.reserved.contains(service.name);
@@ -1955,7 +1969,7 @@ class _RuleSetPickerSheetState extends State<_RuleSetPickerSheet> {
         ? [
             for (final set in searched)
               if (_selected.contains(set.key) ||
-                  !_sensitiveTagPattern.hasMatch(set.tag))
+                  !sensitiveRoutePattern.hasMatch(set.tag))
                 set,
           ]
         : searched;
