@@ -2,7 +2,11 @@
 
 package sockstat
 
-import "golang.org/x/sys/unix"
+import (
+	"time"
+
+	"golang.org/x/sys/unix"
+)
 
 // sampleFD reads TCP transmission counters from a Linux socket via TCP_INFO.
 // The linux build tag also matches Android, whose outbound connections are
@@ -22,5 +26,7 @@ func sampleFD(fd int) (TCPStats, bool) {
 		RetransPackets: uint64(info.Total_retrans),
 		TxBytes:        info.Bytes_sent,
 		RetransBytes:   info.Bytes_retrans,
+		RTT:            time.Duration(info.Rtt) * time.Microsecond,
+		RTTVar:         time.Duration(info.Rttvar) * time.Microsecond,
 	}, true
 }

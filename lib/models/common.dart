@@ -393,6 +393,33 @@ abstract class Proxy with _$Proxy {
 }
 
 @freezed
+abstract class SmartMemberInfo with _$SmartMemberInfo {
+  const factory SmartMemberInfo({
+    @Default(0) int score,
+    @Default(false) bool verified,
+    @Default(false) bool blocked,
+    @Default('') String region,
+    @Default(false) bool cooling,
+  }) = _SmartMemberInfo;
+
+  factory SmartMemberInfo.fromJson(Map<String, Object?> json) =>
+      _$SmartMemberInfoFromJson(json);
+}
+
+@freezed
+abstract class SmartGroupInfo with _$SmartGroupInfo {
+  const factory SmartGroupInfo({
+    @Default('') String service,
+    @Default('') String pin,
+    @Default(false) bool probing,
+    @Default({}) Map<String, SmartMemberInfo> members,
+  }) = _SmartGroupInfo;
+
+  factory SmartGroupInfo.fromJson(Map<String, Object?> json) =>
+      _$SmartGroupInfoFromJson(json);
+}
+
+@freezed
 abstract class Group with _$Group {
   const factory Group({
     required GroupType type,
@@ -402,6 +429,7 @@ abstract class Group with _$Group {
     String? testUrl,
     @Default('') String icon,
     required String name,
+    SmartGroupInfo? smart,
   }) = _Group;
 
   factory Group.fromJson(Map<String, Object?> json) => _$GroupFromJson(json);

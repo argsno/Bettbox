@@ -39,6 +39,12 @@ List<Group> buildGroups(String proxiesRaw) {
           hidden: group['hidden'] as bool?,
           testUrl: group['testUrl'] as String?,
           icon: group['icon'] as String? ?? '',
+          smart: switch (group['smart']) {
+            final Map<dynamic, dynamic> raw => SmartGroupInfo.fromJson(
+              Map<String, Object?>.from(raw),
+            ),
+            _ => null,
+          },
           all: [
             for (final index in (group['all'] as List? ?? const []).cast<int>())
               if (index >= 0 && index < names.length)

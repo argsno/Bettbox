@@ -7,6 +7,7 @@ import (
 	"net"
 	"syscall"
 	"testing"
+	"time"
 )
 
 func TestTCPStatsRetransmitRatio(t *testing.T) {
@@ -24,6 +25,14 @@ func TestTCPStatsRetransmitRatio(t *testing.T) {
 		t.Fatalf("byte ratio mismatch: got %v ok %v", ratio, ok)
 	}
 
+	// tiny connections below the minimum threshold must be skipped
+	if _, ok = (TCPStats{TxPackets: 3, RetransPackets: 1}).RetransmitRatio(); ok {
+		t.Fatalf("tiny packet sample must not report a ratio")
+	}
+	if _, ok = (TCPStats{TxBytes: 1024, RetransBytes: 512}).RetransmitRatio(); ok {
+		t.Fatalf("tiny byte sample must not report a ratio")
+	}
+
 	// no counters at all
 	if _, ok = (TCPStats{}).RetransmitRatio(); ok {
 		t.Fatalf("empty stats must not report a ratio")
@@ -37,16 +46,16 @@ func TestTCPStatsRetransmitRatio(t *testing.T) {
 }
 
 func TestTCPStatsSub(t *testing.T) {
-	base := TCPStats{TxPackets: 100, RetransPackets: 2, TxBytes: 1000, RetransBytes: 20}
-	current := TCPStats{TxPackets: 350, RetransPackets: 5, TxBytes: 4000, RetransBytes: 44}
+	base := TCPStats{TxPackets: 100, RetransPackets: 2, TxBytes: 1000, RetransBytes: 20, RTT: 30 * time.Millisecond, RTTVar: 5 * time.Millisecond}
+	current := TCPStats{TxPackets: 350, RetransPackets: 5, TxBytes: 4000, RetransBytes: 44, RTT: 45 * time.Millisecond, RTTVar: 12 * time.Millisecond}
 	delta := current.Sub(base)
-	want := TCPStats{TxPackets: 250, RetransPackets: 3, TxBytes: 3000, RetransBytes: 24}
+	want := TCPStats{TxPackets: 250, RetransPackets: 3, TxBytes: 3000, RetransBytes: 24, RTT: 45 * time.Millisecond, RTTVar: 12 * time.Millisecond}
 	if delta != want {
 		t.Fatalf("delta mismatch: got %+v want %+v", delta, want)
 	}
 
 	// counters that went backwards (socket reuse) clamp to zero
-	if got := base.Sub(current); got != (TCPStats{}) {
+	if got := base.Sub(current); got != (TCPStats{RTT: 30 * time.Millisecond, RTTVar: 5 * time.Millisecond}) {
 		t.Fatalf("regressed counters must clamp, got %+v", got)
 	}
 }

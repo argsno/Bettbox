@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"math/rand"
 	"net"
@@ -29,9 +30,14 @@ import (
 
 const (
 	smartEwmaAlpha          = 0.3     // weight of the newest real-connection sample
+	smartEwmaSpikeAlpha     = 0.12    // conservative weight for sudden outlier latency spikes
+	smartEwmaStaleAlpha     = 0.5     // faster adaptation after a policy was idle past half-life
 	smartUnknownScore       = 500.0   // ms, assumed latency before any sample exists
 	smartMinScore           = 1.0     // ms
-	smartMaxScore           = 30000.0 // ms
+	smartMaxScore           = 30000.0 // ms, hard clamp for stored/aged scores
+	smartSampleCap          = 5000.0  // ms, real-traffic TTFB above this is dropped (slow backend/LLM/long-poll)
+	smartSpikeFloor         = 1500.0  // ms, minimum ceiling before Winsorizing a single spike
+	smartSpikeMultiplier    = 3.0     // single sample clamped to max(score*3, 1500ms)
 	smartPreferredGapRatio  = 0.15    // preferred set: scores within max(15%, 5ms) of the best
 	smartPreferredGapMin    = 5.0     // ms
 	smartSitePreferredGap   = 0.4     // widened gap for policies that recently worked for the site
@@ -40,6 +46,9 @@ const (
 	smartFailPenalty        = 600.0 // ms added while a policy is in failure cooldown
 	smartLossPenaltyPerPct  = 50.0  // ~50ms per 1% retransmission, like Surge
 	smartLossPenaltyMax     = 2000.0
+	smartJitterBaseMs       = 30.0  // ms of RTTVar tolerated without jitter penalty
+	smartJitterWeight       = 0.5   // ms penalty per ms of RTTVar above smartJitterBaseMs
+	smartJitterPenaltyMax   = 300.0 // ms
 	smartScoreHalfLife      = 10 * time.Minute
 	smartLossHalfLife       = 10 * time.Minute
 	smartUsageHalfLife      = 10 * time.Minute
@@ -47,8 +56,49 @@ const (
 	smartSiteFailureTTL     = 10 * time.Minute
 	smartSiteMemoryMaxSites = 512
 	smartDialRetryLimit     = 3
+	smartDialMinBudget      = 500 * time.Millisecond
+	smartDialFirstMaxBudget = 2 * time.Second
+	smartHedgeMinDelay      = 300 * time.Millisecond
+	smartHedgeMaxDelay      = time.Second
 	smartRankCacheTTL       = time.Second
+	smartExploreEvery       = 25 // general groups probe one non-band alive member every N picks
+	smartWakeupCooldown     = 2 * time.Minute
 )
+
+// smartUnansweredMinWait prevents fast caller-side cancellations (e.g. closed
+// tabs, canceled prefetch, fire-and-forget UDP) from penalizing healthy nodes
+// when no read error occurred.
+var smartUnansweredMinWait = 200 * time.Millisecond
+
+// smartHedgeDelayFn computes how long DialContext waits on the first candidate
+// before hedging with the second candidate. Overridable in tests.
+var smartHedgeDelayFn = defaultSmartHedgeDelay
+
+func defaultSmartHedgeDelay(firstScore float64) time.Duration {
+	if firstScore <= 0 {
+		return smartHedgeMinDelay
+	}
+	d := time.Duration(firstScore*2) * time.Millisecond
+	if d < smartHedgeMinDelay {
+		return smartHedgeMinDelay
+	}
+	if d > smartHedgeMaxDelay {
+		return smartHedgeMaxDelay
+	}
+	return d
+}
+
+// SmartSelectionChangedHook is invoked asynchronously when a Smart group's
+// routing state transitions (probe verdict update or node failure) so the UI
+// can refresh immediately without waiting for polling timers.
+var SmartSelectionChangedHook func()
+
+func notifySmartSelectionChanged() {
+	hook := SmartSelectionChangedHook
+	if hook != nil {
+		go hook()
+	}
+}
 
 type SmartOption struct {
 	PolicyPriority string `group:"policy-priority,omitempty"`
@@ -56,21 +106,69 @@ type SmartOption struct {
 	Pin            string `group:"pin,omitempty"`
 }
 
+// SmartMemberSnapshot exposes compact per-member state for diagnostics and UI.
+type SmartMemberSnapshot struct {
+	Score    int    `json:"score"`
+	Verified bool   `json:"verified,omitempty"`
+	Blocked  bool   `json:"blocked,omitempty"`
+	Region   string `json:"region,omitempty"`
+	Cooling  bool   `json:"cooling,omitempty"`
+}
+
+// SmartSnapshot summarizes a Smart group's runtime state.
+type SmartSnapshot struct {
+	Service string                         `json:"service,omitempty"`
+	Pin     string                         `json:"pin,omitempty"`
+	Probing bool                           `json:"probing,omitempty"`
+	Members map[string]SmartMemberSnapshot `json:"members,omitempty"`
+}
+
 type smartPriorityRule struct {
 	pattern *regexp2.Regexp
 	factor  float64
 }
 
+// proxyHealthSnap holds a lock-free snapshot of a member proxy's URL-test state
+// collected before acquiring Smart.mu.
+type proxyHealthSnap struct {
+	alive bool
+	delay uint16
+}
+
+func snapshotProxyHealth(proxies []C.Proxy, testUrl string) []proxyHealthSnap {
+	snaps := make([]proxyHealthSnap, len(proxies))
+	for i, proxy := range proxies {
+		if proxy == nil {
+			continue
+		}
+		snaps[i] = proxyHealthSnap{
+			alive: proxy.AliveForTestUrl(testUrl),
+			delay: proxy.LastDelayForTestUrl(testUrl),
+		}
+	}
+	return snaps
+}
+
 // smartPolicyState tracks the observed quality of one member policy.
 type smartPolicyState struct {
-	score        float64 // EWMA of first-response latency in ms; 0 means unknown
-	lastSample   time.Time
-	lossPenalty  float64 // EWMA of the retransmission penalty in ms
-	lossUpdated  time.Time
-	lastFail     time.Time
-	failStreak   int
-	usage        float64 // decayed session count, used for Now()
-	usageUpdated time.Time
+	score         float64 // EWMA of first-response latency in ms; 0 means unknown
+	lastSample    time.Time
+	lossPenalty   float64 // EWMA of the retransmission penalty in ms
+	lossUpdated   time.Time
+	jitterPenalty float64 // EWMA of the kernel TCP RTTVar jitter penalty in ms
+	jitterUpdated time.Time
+	lastFail      time.Time
+	failStreak    int
+	usage         float64 // decayed session count, used for Now()
+	usageUpdated  time.Time
+}
+
+func (st *smartPolicyState) clone() *smartPolicyState {
+	if st == nil {
+		return nil
+	}
+	cp := *st
+	return &cp
 }
 
 func (st *smartPolicyState) observeLatency(delayMs float64, now time.Time) {
@@ -83,7 +181,21 @@ func (st *smartPolicyState) observeLatency(delayMs float64, now time.Time) {
 	if st.score <= 0 {
 		st.score = delayMs
 	} else {
-		st.score = st.score*(1-smartEwmaAlpha) + delayMs*smartEwmaAlpha
+		alpha := smartEwmaAlpha
+		sample := delayMs
+		if !st.lastSample.IsZero() && now.Sub(st.lastSample) > smartScoreHalfLife {
+			alpha = smartEwmaStaleAlpha
+		}
+		// Winsorize extreme one-off spikes (e.g. slow API/LLM TTFB) so a single
+		// slow endpoint cannot knock a healthy node out of the preferred band.
+		spikeCap := math.Max(st.score*smartSpikeMultiplier, smartSpikeFloor)
+		if sample > spikeCap {
+			sample = spikeCap
+			if alpha > smartEwmaSpikeAlpha {
+				alpha = smartEwmaSpikeAlpha
+			}
+		}
+		st.score = st.score*(1-alpha) + sample*alpha
 	}
 	st.lastSample = now
 	st.failStreak = 0
@@ -116,16 +228,49 @@ func (st *smartPolicyState) failCooldown() time.Duration {
 	return cooldown
 }
 
+func (st *smartPolicyState) inCooldown(now time.Time) bool {
+	return st.failStreak > 0 && !st.lastFail.IsZero() && now.Sub(st.lastFail) < st.failCooldown()
+}
+
 // observeLoss folds an observed retransmission ratio (0.01 = 1%) into the
-// policy's loss penalty.
+// policy's loss penalty, decaying any stale penalty before smoothing so an old
+// outage is never resurrected by a clean connection hours later.
 func (st *smartPolicyState) observeLoss(ratio float64, now time.Time) {
 	penalty := math.Min(ratio*100*smartLossPenaltyPerPct, smartLossPenaltyMax)
-	if st.lossPenalty <= 0 {
+	prev := st.decayedLoss(now)
+	if prev <= 0 {
 		st.lossPenalty = penalty
 	} else {
-		st.lossPenalty = st.lossPenalty*0.5 + penalty*0.5
+		st.lossPenalty = prev*0.5 + penalty*0.5
 	}
 	st.lossUpdated = now
+}
+
+// observeSocketRTT incorporates transport-level RTT and RTTVar reported by the
+// kernel TCP stack (unaffected by target server application think time).
+func (st *smartPolicyState) observeSocketRTT(rtt, rttvar time.Duration, now time.Time) {
+	if rtt > 0 && st.score <= 0 {
+		rttMs := float64(rtt) / float64(time.Millisecond)
+		if rttMs >= smartMinScore && rttMs <= smartSampleCap {
+			st.score = rttMs
+			st.lastSample = now
+		}
+	}
+	if rttvar <= 0 {
+		return
+	}
+	rttvarMs := float64(rttvar) / float64(time.Millisecond)
+	penalty := 0.0
+	if rttvarMs > smartJitterBaseMs {
+		penalty = math.Min((rttvarMs-smartJitterBaseMs)*smartJitterWeight, smartJitterPenaltyMax)
+	}
+	prev := st.decayedJitter(now)
+	if prev <= 0 {
+		st.jitterPenalty = penalty
+	} else {
+		st.jitterPenalty = prev*0.7 + penalty*0.3
+	}
+	st.jitterUpdated = now
 }
 
 // decayedLoss relaxes a stale loss penalty; without a timestamp the stored
@@ -141,6 +286,17 @@ func (st *smartPolicyState) decayedLoss(now time.Time) float64 {
 	return st.lossPenalty * math.Exp2(-age.Seconds()/smartLossHalfLife.Seconds())
 }
 
+func (st *smartPolicyState) decayedJitter(now time.Time) float64 {
+	if st.jitterUpdated.IsZero() || st.jitterPenalty <= 0 {
+		return st.jitterPenalty
+	}
+	age := now.Sub(st.jitterUpdated)
+	if age <= 0 {
+		return st.jitterPenalty
+	}
+	return st.jitterPenalty * math.Exp2(-age.Seconds()/smartLossHalfLife.Seconds())
+}
+
 // effectiveLatency is the policy's latency in ms: the EWMA sample relaxed
 // toward the URL-test fallback by its age, clamped to the configured range.
 func (st *smartPolicyState) effectiveLatency(fallback float64, now time.Time) float64 {
@@ -150,8 +306,6 @@ func (st *smartPolicyState) effectiveLatency(fallback float64, now time.Time) fl
 		if age < 0 {
 			age = 0
 		}
-		// A stale sample relaxes toward the current URL-test fallback instead of
-		// pinning the policy to an old measurement.
 		score = fallback + (st.score-fallback)*math.Exp2(-age.Seconds()/smartScoreHalfLife.Seconds())
 	}
 	if score < smartMinScore {
@@ -163,19 +317,18 @@ func (st *smartPolicyState) effectiveLatency(fallback float64, now time.Time) fl
 	return score
 }
 
-// penalty is the loss plus failure penalty in ms. It is added after the
+// penalty is the loss, jitter, and failure penalty in ms. It is added after the
 // policy-priority factor has been applied, so a factor below 1 cannot soften
 // an observed penalty.
 func (st *smartPolicyState) penalty(now time.Time) float64 {
-	penalty := st.decayedLoss(now)
-	if st.failStreak > 0 && now.Sub(st.lastFail) < st.failCooldown() {
+	penalty := st.decayedLoss(now) + st.decayedJitter(now)
+	if st.inCooldown(now) {
 		penalty += smartFailPenalty * float64(st.failStreak)
 	}
 	return penalty
 }
 
-// effectiveScore is the latency plus the loss and failure penalties, before
-// the policy-priority factor; factor 1 keeps the historical weighting.
+// effectiveScore is the latency plus penalties, before the policy-priority factor.
 func (st *smartPolicyState) effectiveScore(fallback float64, now time.Time) float64 {
 	return st.scored(fallback, 1.0, now)
 }
@@ -228,14 +381,21 @@ type Smart struct {
 	disableUDP     bool
 	testUrl        string
 	expectedStatus string
+	interval       time.Duration
 
-	mu        sync.Mutex
-	selected  string
-	states    map[string]*smartPolicyState
-	sites     map[string]*smartSiteRecord
-	priority  []smartPriorityRule
-	rankCache *smartRankCache
-	rankGen   uint64
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	mu            sync.RWMutex
+	selected      string
+	states        map[string]*smartPolicyState
+	sites         map[string]*smartSiteRecord
+	priority      []smartPriorityRule
+	priorityCache map[string]float64
+	rankCache     *smartRankCache
+	rankGen       uint64
+	lastWakeup    time.Time
+	pickCounter   atomic.Uint64
 
 	// service is empty unless the group ranks members by their ability to
 	// reach one service and, unless pinSite is set, fixes on one member for
@@ -257,6 +417,131 @@ type Smart struct {
 	forcePendingCurrent string
 }
 
+func (s *Smart) probeContext() context.Context {
+	if s.ctx != nil {
+		return s.ctx
+	}
+	return context.Background()
+}
+
+// Close cancels in-flight background service probes when the group is replaced
+// during a config reload or shutdown.
+func (s *Smart) Close() error {
+	if s.cancel != nil {
+		s.cancel()
+	}
+	if s.GroupBase != nil {
+		return s.GroupBase.Close()
+	}
+	return nil
+}
+
+// ImportStateFrom migrates still-fresh runtime state (verdicts, attempts,
+// latency/loss scores, and site memory) from a replaced Smart group with the
+// same service configuration so config reloads do not trigger cold-start resets.
+func (s *Smart) ImportStateFrom(prev *Smart) {
+	if prev == nil || prev == s {
+		return
+	}
+	now := time.Now()
+	proxies := s.GetProxies(false)
+	memberSet := make(map[string]struct{}, len(proxies))
+	for _, proxy := range proxies {
+		if proxy != nil {
+			memberSet[proxy.Name()] = struct{}{}
+		}
+	}
+
+	prev.mu.RLock()
+	sameService := prev.service == s.service
+	copiedStates := make(map[string]*smartPolicyState, len(prev.states))
+	for name, st := range prev.states {
+		if _, ok := memberSet[name]; !ok {
+			continue
+		}
+		if st != nil {
+			copiedStates[name] = st.clone()
+		}
+	}
+	var copiedVerdicts map[string]serviceVerdict
+	var copiedAttempts map[string]serviceProbeAttempt
+	if sameService && s.service != "" {
+		copiedVerdicts = make(map[string]serviceVerdict, len(prev.verdicts))
+		for name, verdict := range prev.verdicts {
+			if _, ok := memberSet[name]; !ok {
+				continue
+			}
+			if verdict.known && now.Sub(verdict.at) <= serviceVerdictTTL {
+				copiedVerdicts[name] = verdict
+			}
+		}
+		copiedAttempts = make(map[string]serviceProbeAttempt, len(prev.attempts))
+		for name, attempt := range prev.attempts {
+			if _, ok := memberSet[name]; !ok {
+				continue
+			}
+			if now.Sub(attempt.at) < attempt.backoff() {
+				copiedAttempts[name] = attempt
+			}
+		}
+	}
+	var copiedSites map[string]*smartSiteRecord
+	if prev.serviceGroupPin() == s.serviceGroupPin() && sameService {
+		copiedSites = make(map[string]*smartSiteRecord, len(prev.sites))
+		for key, rec := range prev.sites {
+			if rec == nil || now.Sub(rec.updated) > smartSiteMemoryTTL {
+				continue
+			}
+			newRec := &smartSiteRecord{updated: rec.updated, proxies: make(map[string]*smartSiteEntry, len(rec.proxies))}
+			for name, entry := range rec.proxies {
+				if _, ok := memberSet[name]; !ok || entry == nil {
+					continue
+				}
+				cp := *entry
+				newRec.proxies[name] = &cp
+			}
+			if len(newRec.proxies) > 0 {
+				copiedSites[key] = newRec
+			}
+		}
+	}
+	prev.mu.RUnlock()
+
+	s.mu.Lock()
+	if s.states == nil {
+		s.states = make(map[string]*smartPolicyState, len(copiedStates))
+	}
+	for name, st := range copiedStates {
+		s.states[name] = st
+	}
+	if len(copiedVerdicts) > 0 {
+		if s.verdicts == nil {
+			s.verdicts = make(map[string]serviceVerdict, len(copiedVerdicts))
+		}
+		for name, verdict := range copiedVerdicts {
+			s.verdicts[name] = verdict
+		}
+	}
+	if len(copiedAttempts) > 0 {
+		if s.attempts == nil {
+			s.attempts = make(map[string]serviceProbeAttempt, len(copiedAttempts))
+		}
+		for name, attempt := range copiedAttempts {
+			s.attempts[name] = attempt
+		}
+	}
+	if len(copiedSites) > 0 {
+		if s.sites == nil {
+			s.sites = make(map[string]*smartSiteRecord, len(copiedSites))
+		}
+		for key, rec := range copiedSites {
+			s.sites[key] = rec
+		}
+	}
+	s.invalidateRankCacheLocked()
+	s.mu.Unlock()
+}
+
 // Now implements ProxyGroup: the pinned policy, else the member a service
 // group fixes on, else the most-used policy in the recent period, else the
 // best-scored one. Like Surge, the reported selection is not necessarily the
@@ -273,22 +558,26 @@ func (s *Smart) Now() string {
 		}
 	}
 
-	// A service group fixes on one member for everything, so the panel must
-	// name that member, not the best-scored or most-used one.
 	if s.serviceGroupPin() {
 		if item := s.servicePick(proxies, now); item != nil {
 			return item.proxy.Name()
 		}
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+
+	snaps := snapshotProxyHealth(proxies, s.testUrl)
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	bestName := ""
 	bestUsage := 0.0
 	bestScoreName := ""
 	bestScore := math.MaxFloat64
 	blockedScoreName := ""
 	blockedScore := math.MaxFloat64
-	for _, proxy := range proxies {
+	for i, proxy := range proxies {
+		if proxy == nil {
+			continue
+		}
 		name := proxy.Name()
 		st := s.states[name]
 		if st != nil {
@@ -297,7 +586,7 @@ func (s *Smart) Now() string {
 				bestName = name
 			}
 		}
-		score := s.scoreOf(proxy, st, now)
+		score := s.scoreOfSnapLocked(name, snaps[i].delay, st, now)
 		if s.serviceUnusableLocked(name, now) {
 			if score < blockedScore {
 				blockedScore = score
@@ -310,9 +599,6 @@ func (s *Smart) Now() string {
 			bestScoreName = name
 		}
 	}
-	// A policy that still carries recent traffic can have failed its service
-	// probe since; report the best usable one so the panel never advertises a
-	// member the group will not pick first.
 	if bestName != "" && (bestScoreName == "" || !s.serviceUnusableLocked(bestName, now)) {
 		return bestName
 	}
@@ -320,6 +606,45 @@ func (s *Smart) Now() string {
 		return bestScoreName
 	}
 	return blockedScoreName
+}
+
+// Snapshot returns a read-only view of the group's scoring and service-probe
+// state for UI rendering and API diagnostics.
+func (s *Smart) Snapshot() SmartSnapshot {
+	proxies := s.GetProxies(false)
+	now := time.Now()
+	ranked := s.rankedCandidates(proxies, now)
+
+	pinMode := "site"
+	if s.serviceGroupPin() {
+		pinMode = "group"
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	members := make(map[string]SmartMemberSnapshot, len(ranked))
+	for _, item := range ranked {
+		name := item.proxy.Name()
+		st := s.states[name]
+		var region string
+		if v, ok := s.verdicts[name]; ok && v.known && now.Sub(v.at) <= serviceVerdictTTL {
+			region = v.region
+		}
+		members[name] = SmartMemberSnapshot{
+			Score:    int(math.Round(item.score)),
+			Verified: item.verified,
+			Blocked:  item.blocked,
+			Region:   region,
+			Cooling:  st != nil && st.inCooldown(now),
+		}
+	}
+	return SmartSnapshot{
+		Service: s.service,
+		Pin:     pinMode,
+		Probing: s.probing,
+		Members: members,
+	}
 }
 
 // servicePick returns the member a service group fixes on next: the newest
@@ -331,16 +656,13 @@ func (s *Smart) servicePick(proxies []C.Proxy, now time.Time) *smartCandidate {
 	if len(ranked) == 0 {
 		return nil
 	}
-	s.mu.Lock()
-	var entries map[string]smartSiteEntry
+	s.mu.RLock()
+	var siteProxies map[string]*smartSiteEntry
 	if record := s.sites[s.service]; record != nil {
-		entries = make(map[string]smartSiteEntry, len(record.proxies))
-		for name, entry := range record.proxies {
-			entries[name] = *entry
-		}
+		siteProxies = record.proxies
 	}
-	s.mu.Unlock()
-	pick, ok := preferredBandPick(ranked, entries, now, true, true)
+	pick, ok := preferredBandPickRaw(ranked, siteProxies, now, true, true)
+	s.mu.RUnlock()
 	if !ok {
 		return nil
 	}
@@ -358,26 +680,197 @@ func smartNodeFailure(err error) bool {
 }
 
 // smartDialFailure reports whether a dial error is evidence against the node.
-// A deadline from a live caller context is the normal signal for a hanging
-// node, while an error after the caller's context is done says nothing about
-// the node. ErrNotSupport is a capability mismatch, not a health signal.
-func smartDialFailure(ctx context.Context, err error) bool {
+// Only an explicit caller cancellation (context.Canceled on the parent context)
+// or ErrNotSupport absolves the node. A deadline exceeded during a dial—whether
+// from the per-attempt sub-timeout or from a black-hole node exhausting the
+// tunnel's dial timeout—is a node failure so the node enters cooldown and
+// future requests switch away.
+func smartDialFailure(parentCtx context.Context, err error) bool {
 	if err == nil || errors.Is(err, C.ErrNotSupport) {
 		return false
 	}
-	if ctx != nil && ctx.Err() != nil {
+	if parentCtx != nil && errors.Is(parentCtx.Err(), context.Canceled) {
 		return false
 	}
 	return true
 }
 
+// dialAttemptContext derives a per-attempt sub-timeout from parentCtx so a
+// single black-hole candidate cannot consume the entire tunnel dial deadline
+// and prevent fallback to remaining candidates.
+func dialAttemptContext(parentCtx context.Context, attempt, limit int) (context.Context, context.CancelFunc) {
+	deadline, hasDeadline := parentCtx.Deadline()
+	if !hasDeadline {
+		return parentCtx, func() {}
+	}
+	remaining := time.Until(deadline)
+	if remaining <= 0 || attempt >= limit-1 || remaining <= smartDialMinBudget {
+		return parentCtx, func() {}
+	}
+	var budget time.Duration
+	if attempt == 0 {
+		budget = remaining * 3 / 5
+		if budget > smartDialFirstMaxBudget {
+			budget = smartDialFirstMaxBudget
+		}
+	} else {
+		left := limit - attempt
+		budget = remaining / time.Duration(left)
+	}
+	if budget < smartDialMinBudget {
+		budget = smartDialMinBudget
+	}
+	if budget >= remaining {
+		return parentCtx, func() {}
+	}
+	return context.WithTimeout(parentCtx, budget)
+}
+
+func (s *Smart) wrapDialedConn(conn C.Conn, proxy C.Proxy, metadata *C.Metadata, dialDone time.Time, dialLatency time.Duration) C.Conn {
+	s.reportUsed(proxy.Name())
+	conn.AppendToChains(s)
+
+	if N.NeedHandshake(conn) {
+		conn = callback.NewFirstWriteCallBackConn(conn, func(err error) {
+			if err == nil {
+				s.onDialSuccess()
+				return
+			}
+			if smartNodeFailure(err) {
+				// EarlyConn handshake failures happen on first write after
+				// DialContext already returned; record node failure so tunnel
+				// retries immediately pick a different candidate.
+				s.reportFailure(proxy.Name(), metadata)
+				s.onDialFailed(proxy.Type(), err, s.healthCheck)
+			}
+		})
+	}
+	return newSmartConn(conn, s, proxy.Name(), metadata, dialDone, dialLatency)
+}
+
+type hedgeResult struct {
+	idx     int
+	proxy   C.Proxy
+	conn    C.Conn
+	err     error
+	doneAt  time.Time
+	latency time.Duration
+}
+
+// dialHedged dials candidates[0], and if it stays silent past hedgeDelay,
+// concurrently dials candidates[1] so slow or black-holed nodes fail over in
+// sub-second time. The loser is canceled and closed if it finishes late.
+func (s *Smart) dialHedged(ctx context.Context, metadata *C.Metadata, first, second C.Proxy, hedgeDelay time.Duration) (C.Conn, C.Proxy, error, bool) {
+	attemptCtx1, cancel1 := dialAttemptContext(ctx, 0, smartDialRetryLimit)
+	ch := make(chan hedgeResult, 2)
+
+	dialOne := func(idx int, dialCtx context.Context, p C.Proxy) {
+		start := time.Now()
+		conn, err := p.DialContext(dialCtx, metadata)
+		done := time.Now()
+		lat := done.Sub(start)
+		if lat < 0 {
+			lat = 0
+		}
+		ch <- hedgeResult{idx: idx, proxy: p, conn: conn, err: err, doneAt: done, latency: lat}
+	}
+
+	go dialOne(0, attemptCtx1, first)
+
+	timer := time.NewTimer(hedgeDelay)
+	defer timer.Stop()
+
+	var cancel2 context.CancelFunc
+	hedged := false
+
+	select {
+	case res := <-ch:
+		cancel1()
+		if res.err == nil {
+			return s.wrapDialedConn(res.conn, res.proxy, metadata, res.doneAt, res.latency), res.proxy, nil, false
+		}
+		if smartDialFailure(ctx, res.err) {
+			s.reportFailure(res.proxy.Name(), metadata)
+		}
+		return nil, res.proxy, res.err, false
+	case <-timer.C:
+		if ctx.Err() != nil {
+			cancel1()
+			return nil, first, ctx.Err(), false
+		}
+		hedged = true
+		var attemptCtx2 context.Context
+		attemptCtx2, cancel2 = dialAttemptContext(ctx, 1, smartDialRetryLimit)
+		go dialOne(1, attemptCtx2, second)
+	case <-ctx.Done():
+		cancel1()
+		return nil, first, ctx.Err(), false
+	}
+
+	defer func() {
+		cancel1()
+		if cancel2 != nil {
+			cancel2()
+		}
+	}()
+
+	var lastErr error
+	var lastProxy C.Proxy
+	for completed := 0; completed < 2; completed++ {
+		res := <-ch
+		if res.err == nil {
+			// Cancel the slower branch and drain/close its connection if it arrives.
+			if res.idx == 0 && cancel2 != nil {
+				cancel2()
+			} else if res.idx == 1 {
+				cancel1()
+			}
+			if completed == 0 {
+				go func() {
+					other := <-ch
+					if other.conn != nil {
+						_ = other.conn.Close()
+					}
+					// If the primary timed out / errored while the hedge won,
+					// do not penalize a mere cancellation caused by winning.
+				}()
+			}
+			return s.wrapDialedConn(res.conn, res.proxy, metadata, res.doneAt, res.latency), res.proxy, nil, hedged
+		}
+		lastErr = res.err
+		lastProxy = res.proxy
+		if smartDialFailure(ctx, res.err) {
+			s.reportFailure(res.proxy.Name(), metadata)
+		}
+	}
+	return nil, lastProxy, lastErr, hedged
+}
+
 // DialContext implements C.ProxyAdapter
 func (s *Smart) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, error) {
-	candidates := s.orderedCandidates(metadata, true)
+	candidates, canHedge, firstScore := s.selectDialCandidates(metadata, true, false)
 
 	var lastErr error
 	var lastProxy C.Proxy
 	attempts := 0
+
+	if canHedge && len(candidates) >= 2 && ctx.Err() == nil {
+		hedgeDelay := smartHedgeDelayFn(firstScore)
+		conn, proxy, err, hedged := s.dialHedged(ctx, metadata, candidates[0], candidates[1], hedgeDelay)
+		if err == nil {
+			return conn, nil
+		}
+		lastErr = err
+		lastProxy = proxy
+		if hedged {
+			attempts = 2
+			candidates = candidates[2:]
+		} else {
+			attempts = 1
+			candidates = candidates[1:]
+		}
+	}
+
 	for _, proxy := range candidates {
 		if err := ctx.Err(); err != nil {
 			if lastErr == nil {
@@ -386,8 +879,10 @@ func (s *Smart) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, 
 			break
 		}
 
+		attemptCtx, cancel := dialAttemptContext(ctx, attempts, smartDialRetryLimit)
 		dialStart := time.Now()
-		conn, err := proxy.DialContext(ctx, metadata)
+		conn, err := proxy.DialContext(attemptCtx, metadata)
+		cancel()
 		if err != nil {
 			lastErr = err
 			lastProxy = proxy
@@ -395,8 +890,6 @@ func (s *Smart) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, 
 			if smartDialFailure(ctx, err) {
 				s.reportFailure(proxy.Name(), metadata)
 			}
-			// Only the caller's context ending stops the retry loop. A node's
-			// own dial timeout is a failure worth trying the next member for.
 			if ctx.Err() != nil {
 				break
 			}
@@ -412,29 +905,12 @@ func (s *Smart) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, 
 			dialLatency = 0
 		}
 
-		s.reportUsed(proxy.Name())
-		conn.AppendToChains(s)
-
-		if N.NeedHandshake(conn) {
-			conn = callback.NewFirstWriteCallBackConn(conn, func(err error) {
-				if err == nil {
-					s.onDialSuccess()
-					return
-				}
-				if smartNodeFailure(err) {
-					s.onDialFailed(proxy.Type(), err, s.healthCheck)
-				}
-			})
-		}
-
-		return newSmartConn(conn, s, proxy.Name(), metadata, dialDone, dialLatency), nil
+		return s.wrapDialedConn(conn, proxy, metadata, dialDone, dialLatency), nil
 	}
 
 	if lastErr == nil {
 		lastErr = errors.New("smart: no available proxy")
 	} else if lastProxy != nil && smartDialFailure(ctx, lastErr) {
-		// Retrying one request through several members is one group-level
-		// failure, not one per candidate.
 		s.onDialFailed(lastProxy.Type(), lastErr, s.healthCheck)
 	}
 	return nil, lastErr
@@ -442,7 +918,7 @@ func (s *Smart) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, 
 
 // ListenPacketContext implements C.ProxyAdapter
 func (s *Smart) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (C.PacketConn, error) {
-	candidates := s.orderedCandidates(metadata, true)
+	candidates, _, _ := s.selectDialCandidates(metadata, true, true)
 
 	var lastErr error
 	var lastProxy C.Proxy
@@ -458,8 +934,10 @@ func (s *Smart) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (
 			break
 		}
 
+		attemptCtx, cancel := dialAttemptContext(ctx, attempts, smartDialRetryLimit)
 		listenStart := time.Now()
-		pc, err := proxy.ListenPacketContext(ctx, metadata)
+		pc, err := proxy.ListenPacketContext(attemptCtx, metadata)
+		cancel()
 		if err != nil {
 			lastErr = err
 			lastProxy = proxy
@@ -543,9 +1021,9 @@ func (s *Smart) representativeProxy(metadata *C.Metadata, touch bool) C.Proxy {
 		return nil
 	}
 
-	s.mu.Lock()
+	s.mu.RLock()
 	pinned := s.selected
-	s.mu.Unlock()
+	s.mu.RUnlock()
 
 	if pinned != "" {
 		for _, item := range ranked {
@@ -554,8 +1032,6 @@ func (s *Smart) representativeProxy(metadata *C.Metadata, touch bool) C.Proxy {
 			}
 		}
 	}
-	// A service group stands for the member it fixes on, so capability
-	// questions are answered by the machine the traffic actually uses.
 	if s.serviceGroupPin() {
 		if item := s.servicePick(proxies, now); item != nil {
 			return item.proxy
@@ -575,7 +1051,12 @@ func (s *Smart) MarshalJSON() ([]byte, error) {
 	for _, proxy := range s.GetProxies(false) {
 		all = append(all, proxy.Name())
 	}
-	return json.Marshal(map[string]any{
+	emptyFallbackName := ""
+	if ef := s.EmptyFallback(); ef != nil {
+		emptyFallbackName = ef.Name()
+	}
+	snap := s.Snapshot()
+	payload := map[string]any{
 		"type":           s.Type().String(),
 		"now":            s.Now(),
 		"all":            all,
@@ -584,13 +1065,15 @@ func (s *Smart) MarshalJSON() ([]byte, error) {
 		"fixed":          s.fixedName(),
 		"hidden":         s.Hidden(),
 		"icon":           s.Icon(),
-		"emptyFallback":  s.EmptyFallback().Name(),
-	})
+		"emptyFallback":  emptyFallbackName,
+		"smart":          snap,
+	}
+	return json.Marshal(payload)
 }
 
 func (s *Smart) fixedName() string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return s.selected
 }
 
@@ -624,26 +1107,65 @@ func (s *Smart) URLTest(ctx context.Context, url string, expectedStatus utils.In
 
 func (s *Smart) healthCheck() {
 	s.GroupBase.healthCheck()
-	// AliveForTestUrl consults each proxy's own state; snapshot it before taking
-	// s.mu so this lock is never held while calling into a proxy.
-	alive := make(map[string]bool)
 	proxies := s.GetProxies(false)
-	for _, proxy := range proxies {
+	snaps := snapshotProxyHealth(proxies, s.testUrl)
+	alive := make(map[string]bool, len(proxies))
+	current := make(map[string]struct{}, len(proxies))
+	for i, proxy := range proxies {
 		if proxy == nil {
 			continue
 		}
-		alive[proxy.Name()] = proxy.AliveForTestUrl(s.testUrl)
+		name := proxy.Name()
+		current[name] = struct{}{}
+		alive[name] = snaps[i].alive
 	}
 	s.mu.Lock()
 	for name, st := range s.states {
+		if _, ok := current[name]; !ok {
+			delete(s.states, name)
+			continue
+		}
 		if alive[name] {
 			st.failStreak = 0
+		}
+	}
+	for name := range s.priorityCache {
+		if _, ok := current[name]; !ok {
+			delete(s.priorityCache, name)
 		}
 	}
 	s.invalidateRankCacheLocked()
 	s.mu.Unlock()
 
 	s.maybeProbeService(proxies)
+}
+
+// maybeWakeupHealthCheck triggers an async URL test when a lazy group wakes up
+// without any measured member delays, so cold-start traffic does not stay
+// trapped on the first randomly sampled node for up to 10 minutes.
+func (s *Smart) maybeWakeupHealthCheck(proxies []C.Proxy, snaps []proxyHealthSnap, now time.Time) {
+	if len(proxies) == 0 || len(s.providers) == 0 {
+		return
+	}
+	hasMeasured := false
+	for _, snap := range snaps {
+		if snap.delay != 0 && snap.delay != 0xffff {
+			hasMeasured = true
+			break
+		}
+	}
+	if hasMeasured {
+		return
+	}
+	s.mu.Lock()
+	if !s.lastWakeup.IsZero() && now.Sub(s.lastWakeup) < smartWakeupCooldown {
+		s.mu.Unlock()
+		return
+	}
+	s.lastWakeup = now
+	s.mu.Unlock()
+
+	go s.healthCheck()
 }
 
 type smartCandidate struct {
@@ -656,8 +1178,7 @@ type smartCandidate struct {
 
 // siteStatus classifies a policy for one destination using a snapshot of the
 // group's site memory. A hit widens the preferred gap, a miss keeps the policy
-// out of the first pick. Both are derived from the live record, so site memory
-// does not need to be part of the cached ranking.
+// out of the first pick.
 func siteStatus(entries map[string]smartSiteEntry, name string, now time.Time) (hit, miss bool) {
 	if entries == nil {
 		return false, false
@@ -666,6 +1187,21 @@ func siteStatus(entries map[string]smartSiteEntry, name string, now time.Time) (
 	if !ok {
 		return false, false
 	}
+	return siteEntryStatus(entry, now)
+}
+
+func siteStatusRaw(entries map[string]*smartSiteEntry, name string, now time.Time) (hit, miss bool) {
+	if entries == nil {
+		return false, false
+	}
+	entry, ok := entries[name]
+	if !ok || entry == nil {
+		return false, false
+	}
+	return siteEntryStatus(*entry, now)
+}
+
+func siteEntryStatus(entry smartSiteEntry, now time.Time) (hit, miss bool) {
 	successFresh := !entry.lastSuccess.IsZero() && now.Sub(entry.lastSuccess) < smartSiteMemoryTTL
 	failureFresh := !entry.lastFailure.IsZero() && now.Sub(entry.lastFailure) < smartSiteFailureTTL
 	hit = successFresh && (!failureFresh || entry.lastSuccess.After(entry.lastFailure))
@@ -674,9 +1210,7 @@ func siteStatus(entries map[string]smartSiteEntry, name string, now time.Time) (
 }
 
 // stickySitePick returns the preferred member with the newest success in the
-// group's memory record. The pick is self-reinforcing: while the member keeps
-// answering, its success stays the newest, and it drops out as soon as it
-// fails, falls out of the preferred band, or the service probe demotes it.
+// group's memory record.
 func stickySitePick(ranked []smartCandidate, preferred []int, entries map[string]smartSiteEntry, now time.Time) (int, bool) {
 	sticky := -1
 	var newest time.Time
@@ -692,25 +1226,45 @@ func stickySitePick(ranked []smartCandidate, preferred []int, entries map[string
 	return sticky, sticky >= 0
 }
 
+func stickySitePickRaw(ranked []smartCandidate, preferred []int, entries map[string]*smartSiteEntry, now time.Time) (int, bool) {
+	sticky := -1
+	var newest time.Time
+	for _, idx := range preferred {
+		name := ranked[idx].proxy.Name()
+		if hit, _ := siteStatusRaw(entries, name, now); !hit {
+			continue
+		}
+		if success := entries[name].lastSuccess; sticky < 0 || success.After(newest) {
+			sticky, newest = idx, success
+		}
+	}
+	return sticky, sticky >= 0
+}
+
 // preferredBandPick returns the first choice among the policies inside the
-// preferred band around the best usable score. A service group first narrows
-// the field to members whose probe confirmed the service works: an unverified
-// member only competes when no verified one is usable, so latency alone never
-// outranks a confirmed member. Sticky picks the band member with the newest
-// success -- Google and OpenAI tie sessions to the egress IP, so a service
-// group keeps answering on one member. Deterministic fixes the cold start on
-// the best band member so the first burst of connections concentrates on one
-// machine and forms the pin; without it the pick rotates randomly inside the
-// band, spreading load by design. General groups pass neither flag.
+// preferred band around the best usable score. Kept with value-map signature
+// for direct unit tests.
 func preferredBandPick(ranked []smartCandidate, entries map[string]smartSiteEntry, now time.Time, sticky, deterministic bool) (int, bool) {
-	// A verification is only worth preferring while one is actually usable;
-	// otherwise the group would fall back to a slower member or stay empty.
+	var raw map[string]*smartSiteEntry
+	if len(entries) > 0 {
+		raw = make(map[string]*smartSiteEntry, len(entries))
+		for k, v := range entries {
+			entry := v
+			raw[k] = &entry
+		}
+	}
+	return preferredBandPickRaw(ranked, raw, now, sticky, deterministic)
+}
+
+// preferredBandPickRaw performs band selection directly over the group's site
+// map under RLock without allocating a copied map per connection.
+func preferredBandPickRaw(ranked []smartCandidate, entries map[string]*smartSiteEntry, now time.Time, sticky, deterministic bool) (int, bool) {
 	verifiedUsable := false
 	for _, item := range ranked {
 		if !item.alive || item.blocked || !item.verified {
 			continue
 		}
-		if _, miss := siteStatus(entries, item.proxy.Name(), now); miss {
+		if _, miss := siteStatusRaw(entries, item.proxy.Name(), now); miss {
 			continue
 		}
 		verifiedUsable = true
@@ -723,7 +1277,7 @@ func preferredBandPick(ranked []smartCandidate, entries map[string]smartSiteEntr
 		if verifiedUsable && !item.verified {
 			return false
 		}
-		_, miss := siteStatus(entries, item.proxy.Name(), now)
+		_, miss := siteStatusRaw(entries, item.proxy.Name(), now)
 		return !miss
 	}
 
@@ -742,12 +1296,13 @@ func preferredBandPick(ranked []smartCandidate, entries map[string]smartSiteEntr
 	}
 
 	baseGap := math.Max(best*smartPreferredGapRatio, smartPreferredGapMin)
-	var preferred []int
+	var preferredStack [16]int
+	preferred := preferredStack[:0]
 	for i, item := range ranked {
 		if !usable(item) {
 			continue
 		}
-		hit, _ := siteStatus(entries, item.proxy.Name(), now)
+		hit, _ := siteStatusRaw(entries, item.proxy.Name(), now)
 		gap := baseGap
 		if hit {
 			gap = math.Max(best*smartSitePreferredGap, smartPreferredGapMin)
@@ -760,7 +1315,7 @@ func preferredBandPick(ranked []smartCandidate, entries map[string]smartSiteEntr
 		return -1, false
 	}
 	if sticky {
-		if member, ok := stickySitePick(ranked, preferred, entries, now); ok {
+		if member, ok := stickySitePickRaw(ranked, preferred, entries, now); ok {
 			return member, true
 		}
 	}
@@ -779,43 +1334,65 @@ func sameProxyList(a, b []C.Proxy) bool {
 
 // rankedCandidates returns the group's members ordered by score. The result is
 // cached for smartRankCacheTTL and shared between connections; callers must
-// treat it as read-only. Rebuilding the ranking per connection would repeat the
-// same score reads and sort for every socket in a page load, while the
-// underlying samples decay over minutes, not milliseconds.
+// treat it as read-only.
 func (s *Smart) rankedCandidates(proxies []C.Proxy, now time.Time) []smartCandidate {
-	s.mu.Lock()
+	s.mu.RLock()
 	if cache := s.rankCache; cache != nil &&
 		cache.gen == s.rankGen &&
 		now.Sub(cache.builtAt) < smartRankCacheTTL &&
 		sameProxyList(cache.proxies, proxies) {
 		ranked := cache.ranked
-		s.mu.Unlock()
+		s.mu.RUnlock()
 		return ranked
 	}
 	gen := s.rankGen
+	s.mu.RUnlock()
+
+	// Snapshot each proxy's health outside s.mu to maintain lock ordering.
+	snaps := snapshotProxyHealth(proxies, s.testUrl)
+	s.maybeWakeupHealthCheck(proxies, snaps, now)
+
+	// Precompute priority factors if any rules exist and cache misses occur.
+	var factors []float64
+	if len(s.priority) > 0 {
+		factors = s.resolvePriorityFactors(proxies)
+	}
+
+	s.mu.RLock()
 	candidates := make([]smartCandidate, 0, len(proxies))
-	for _, proxy := range proxies {
+	for i, proxy := range proxies {
 		if proxy == nil {
 			continue
 		}
-		st := s.states[proxy.Name()]
+		name := proxy.Name()
+		st := s.states[name]
+		factor := 1.0
+		if factors != nil {
+			factor = factors[i]
+		}
+		fallback := smartUnknownScore
+		if snaps[i].delay != 0xffff && snaps[i].delay > 0 {
+			fallback = float64(snaps[i].delay)
+		}
+		score := fallback * factor
+		if st != nil {
+			score = st.scored(fallback, factor, now)
+		}
 		candidates = append(candidates, smartCandidate{
 			proxy:    proxy,
-			score:    s.scoreOf(proxy, st, now),
-			alive:    proxy.AliveForTestUrl(s.testUrl),
-			blocked:  s.serviceUnusableLocked(proxy.Name(), now),
-			verified: s.serviceVerifiedLocked(proxy.Name(), now),
+			score:    score,
+			alive:    snaps[i].alive,
+			blocked:  s.serviceUnusableLocked(name, now),
+			verified: s.serviceVerifiedLocked(name, now),
 		})
 	}
-	s.mu.Unlock()
+	s.mu.RUnlock()
 
 	sort.SliceStable(candidates, func(i, j int) bool {
 		return candidates[i].score < candidates[j].score
 	})
 
 	s.mu.Lock()
-	// A failure or health check invalidated the ranking while it was being
-	// built; do not resurrect the stale order.
 	if s.rankGen == gen {
 		s.rankCache = &smartRankCache{
 			proxies: proxies,
@@ -828,19 +1405,222 @@ func (s *Smart) rankedCandidates(proxies []C.Proxy, now time.Time) []smartCandid
 	return candidates
 }
 
-// orderedCandidates returns the policies to try for one request: the preferred
-// pick first (a random member of the policies closest to the best score, or
-// the pinned one), then the remaining healthy policies by score, then the ones
-// a service probe demoted, then the failed ones, so a dead connection can fall
-// back to the next candidate.
+// resolvePriorityFactors returns the priority factor for each proxy, caching
+// regex evaluations in s.priorityCache so regexp2 does not run on every cache rebuild.
+func (s *Smart) resolvePriorityFactors(proxies []C.Proxy) []float64 {
+	factors := make([]float64, len(proxies))
+	var missingIdx []int
+
+	s.mu.RLock()
+	for i, proxy := range proxies {
+		if proxy == nil {
+			factors[i] = 1.0
+			continue
+		}
+		if f, ok := s.priorityCache[proxy.Name()]; ok {
+			factors[i] = f
+		} else {
+			missingIdx = append(missingIdx, i)
+		}
+	}
+	s.mu.RUnlock()
+
+	if len(missingIdx) == 0 {
+		return factors
+	}
+	for _, idx := range missingIdx {
+		factors[idx] = s.priorityFactor(proxies[idx].Name())
+	}
+	s.mu.Lock()
+	if s.priorityCache == nil {
+		s.priorityCache = make(map[string]float64, len(proxies))
+	}
+	for _, idx := range missingIdx {
+		s.priorityCache[proxies[idx].Name()] = factors[idx]
+	}
+	s.mu.Unlock()
+	return factors
+}
+
+// pickFirstIndexLocked resolves the first candidate index using the group's
+// pinned member, site memory, and preferred band. Callers must hold s.mu.RLock.
+func (s *Smart) pickFirstIndexLocked(ranked []smartCandidate, siteKey string, now time.Time, allowExplore bool) (int, bool) {
+	var siteProxies map[string]*smartSiteEntry
+	if siteKey != "" {
+		if record := s.sites[siteKey]; record != nil {
+			siteProxies = record.proxies
+		}
+	}
+
+	if s.selected != "" {
+		for i, item := range ranked {
+			if item.proxy.Name() == s.selected {
+				return i, true
+			}
+		}
+	}
+
+	// Controlled exploration for general groups: every smartExploreEvery picks,
+	// give a near-band or unsampled alive member a chance to prove it recovered.
+	if allowExplore && s.service == "" && len(ranked) > 1 && s.pickCounter.Add(1)%smartExploreEvery == 0 {
+		if idx, ok := s.exploreCandidateLocked(ranked, siteProxies, now); ok {
+			return idx, false
+		}
+	}
+
+	if pick, ok := preferredBandPickRaw(ranked, siteProxies, now, s.service != "", s.serviceGroupPin()); ok {
+		return pick, false
+	}
+
+	// Fallback when every live member has a site miss: prefer healthy live over blocked over dead.
+	for i, item := range ranked {
+		if item.alive && !item.blocked {
+			return i, false
+		}
+	}
+	for i, item := range ranked {
+		if item.alive {
+			return i, false
+		}
+	}
+	return 0, false
+}
+
+// exploreCandidateLocked selects an unsampled or near-top alive member outside
+// the immediate winner so general groups can rediscover improved nodes without
+// waiting for a full 10-minute decay cycle. Callers must hold s.mu.RLock.
+func (s *Smart) exploreCandidateLocked(ranked []smartCandidate, siteProxies map[string]*smartSiteEntry, now time.Time) (int, bool) {
+	limit := len(ranked)
+	if limit > 8 {
+		limit = 8
+	}
+	var pool [8]int
+	n := 0
+	for i := 1; i < limit; i++ {
+		item := ranked[i]
+		if !item.alive || item.blocked {
+			continue
+		}
+		if _, miss := siteStatusRaw(siteProxies, item.proxy.Name(), now); miss {
+			continue
+		}
+		st := s.states[item.proxy.Name()]
+		if st != nil && st.inCooldown(now) {
+			continue
+		}
+		pool[n] = i
+		n++
+	}
+	if n == 0 {
+		return -1, false
+	}
+	return pool[rand.Intn(n)], true
+}
+
+// selectDialCandidates picks at most smartDialRetryLimit candidates on the hot
+// path (or all UDP-capable candidates up to the retry limit) without building
+// an O(N) slice on large rosters.
+func (s *Smart) selectDialCandidates(metadata *C.Metadata, touch, requireUDP bool) (candidates []C.Proxy, canHedge bool, firstScore float64) {
+	proxies := s.GetProxies(touch)
+	if len(proxies) == 0 {
+		return nil, false, 0
+	}
+	s.maybeProbeService(proxies)
+
+	now := time.Now()
+	ranked := s.rankedCandidates(proxies, now)
+	if len(ranked) == 0 {
+		return nil, false, 0
+	}
+	siteKey := s.memoryKey(metadata)
+
+	s.mu.RLock()
+	firstPick, isPinned := s.pickFirstIndexLocked(ranked, siteKey, now, !requireUDP)
+	var hit, miss bool
+	if siteKey != "" && firstPick >= 0 {
+		if record := s.sites[siteKey]; record != nil {
+			hit, miss = siteStatusRaw(record.proxies, ranked[firstPick].proxy.Name(), now)
+		}
+	}
+	s.mu.RUnlock()
+
+	order := make([]C.Proxy, 0, smartDialRetryLimit)
+	var secondHealthy bool
+	addIfEligible := func(idx int) bool {
+		p := ranked[idx].proxy
+		if requireUDP && !p.SupportUDP() {
+			return false
+		}
+		if len(order) == 1 && ranked[idx].alive && !ranked[idx].blocked {
+			secondHealthy = true
+		}
+		order = append(order, p)
+		return len(order) >= smartDialRetryLimit
+	}
+
+	if firstPick >= 0 {
+		first := ranked[firstPick]
+		firstScore = first.score
+		log.Debugln("[Smart] %s picked %s (score %.1fms, siteHit=%t, siteMiss=%t, verified=%t, site=%q)",
+			s.Name(), first.proxy.Name(), first.score, hit, miss, first.verified, siteKey)
+		if addIfEligible(firstPick) {
+			return order, false, firstScore
+		}
+	}
+
+	for i, item := range ranked {
+		if i == firstPick || !item.alive || item.blocked || !item.verified {
+			continue
+		}
+		if addIfEligible(i) {
+			break
+		}
+	}
+	if len(order) < smartDialRetryLimit {
+		for i, item := range ranked {
+			if i == firstPick || !item.alive || item.blocked || item.verified {
+				continue
+			}
+			if addIfEligible(i) {
+				break
+			}
+		}
+	}
+	if len(order) < smartDialRetryLimit {
+		for i, item := range ranked {
+			if i == firstPick || !item.alive || !item.blocked {
+				continue
+			}
+			if addIfEligible(i) {
+				break
+			}
+		}
+	}
+	if len(order) < smartDialRetryLimit {
+		for i, item := range ranked {
+			if i == firstPick || item.alive {
+				continue
+			}
+			if addIfEligible(i) {
+				break
+			}
+		}
+	}
+
+	// Only hedge on non-pinned, non-service-group-pin TCP dials when the second
+	// candidate is healthy so service groups preserve strict single-IP affinity.
+	canHedge = !requireUDP && !isPinned && !s.serviceGroupPin() && len(order) >= 2 && secondHealthy
+	return order, canHedge, firstScore
+}
+
+// orderedCandidates returns the full ordered list of policies to try for one
+// request (preferred pick first, then remaining healthy verified, unverified,
+// blocked, and dead policies). Kept for full-order callers and unit tests.
 func (s *Smart) orderedCandidates(metadata *C.Metadata, touch bool) []C.Proxy {
 	proxies := s.GetProxies(touch)
 	if len(proxies) == 0 {
 		return nil
 	}
-	// Connections are the trigger to learn which members can serve the
-	// service; the selection skips members with a fresh verdict, so a group
-	// that already knows its members dials nothing extra.
 	s.maybeProbeService(proxies)
 
 	now := time.Now()
@@ -848,73 +1628,26 @@ func (s *Smart) orderedCandidates(metadata *C.Metadata, touch bool) []C.Proxy {
 	if len(ranked) == 0 {
 		return nil
 	}
-	// Service groups share one memory record, so the pin formed on any
-	// destination carries the whole group.
 	siteKey := s.memoryKey(metadata)
 
-	s.mu.Lock()
-	var siteEntries map[string]smartSiteEntry
-	if siteKey != "" {
+	s.mu.RLock()
+	firstPick, _ := s.pickFirstIndexLocked(ranked, siteKey, now, false)
+	var hit, miss bool
+	if siteKey != "" && firstPick >= 0 {
 		if record := s.sites[siteKey]; record != nil {
-			siteEntries = make(map[string]smartSiteEntry, len(record.proxies))
-			for name, entry := range record.proxies {
-				siteEntries[name] = *entry
-			}
+			hit, miss = siteStatusRaw(record.proxies, ranked[firstPick].proxy.Name(), now)
 		}
 	}
-	pinned := s.selected
-	s.mu.Unlock()
-
-	firstPick := -1
-	if pinned != "" {
-		for i, item := range ranked {
-			if item.proxy.Name() == pinned {
-				firstPick = i
-				break
-			}
-		}
-	}
-
-	if firstPick < 0 {
-		if pick, ok := preferredBandPick(ranked, siteEntries, now, s.service != "", s.serviceGroupPin()); ok {
-			firstPick = pick
-		} else {
-			// nothing preferred: still try a live policy before a dead one, even
-			// if every live policy is suspended for this site.
-			firstPick = 0
-			healthy := false
-			for i, item := range ranked {
-				if item.alive && !item.blocked {
-					firstPick = i
-					healthy = true
-					break
-				}
-			}
-			if !healthy {
-				// Every live member is service-blocked; a blocked member is still a
-				// better first pick than a member whose URL test failed.
-				for i, item := range ranked {
-					if item.alive {
-						firstPick = i
-						break
-					}
-				}
-			}
-		}
-	}
+	s.mu.RUnlock()
 
 	order := make([]C.Proxy, 0, len(ranked))
 	if firstPick >= 0 {
 		first := ranked[firstPick]
-		hit, miss := siteStatus(siteEntries, first.proxy.Name(), now)
 		order = append(order, first.proxy)
 		log.Debugln("[Smart] %s picked %s (score %.1fms, siteHit=%t, siteMiss=%t, verified=%t, site=%q)",
 			s.Name(), first.proxy.Name(), first.score, hit, miss, first.verified, siteKey)
 	}
 
-	// The fallback follows the same evidence order as the first pick: members a
-	// probe confirmed, then never-probed ones, then members the service refused,
-	// and finally members whose URL test failed.
 	for i, item := range ranked {
 		if i == firstPick || !item.alive || item.blocked || !item.verified {
 			continue
@@ -927,8 +1660,6 @@ func (s *Smart) orderedCandidates(metadata *C.Metadata, touch bool) []C.Proxy {
 		}
 		order = append(order, item.proxy)
 	}
-	// A member that cannot serve the service is still a better fallback than a
-	// member whose last URL test failed.
 	for i, item := range ranked {
 		if i == firstPick || !item.alive || !item.blocked {
 			continue
@@ -944,19 +1675,31 @@ func (s *Smart) orderedCandidates(metadata *C.Metadata, touch bool) []C.Proxy {
 	return order
 }
 
-// scoreOf combines the policy's EWMA latency (seeded by URL test results) with
-// its loss and failure penalties. The policy-priority factor scales the
-// latency only, so a premium factor cannot also discount a failure penalty.
-func (s *Smart) scoreOf(proxy C.Proxy, st *smartPolicyState, now time.Time) float64 {
+// scoreOfSnapLocked scores one member using a pre-fetched delay snapshot.
+// Callers must hold s.mu (read or write).
+func (s *Smart) scoreOfSnapLocked(name string, delay uint16, st *smartPolicyState, now time.Time) float64 {
 	fallback := smartUnknownScore
-	if delay := proxy.LastDelayForTestUrl(s.testUrl); delay != 0xffff && delay > 0 {
+	if delay != 0xffff && delay > 0 {
 		fallback = float64(delay)
 	}
-	factor := s.priorityFactor(proxy.Name())
+	factor := 1.0
+	if len(s.priority) > 0 {
+		if cached, ok := s.priorityCache[name]; ok {
+			factor = cached
+		} else {
+			factor = s.priorityFactor(name)
+		}
+	}
 	if st == nil {
 		return fallback * factor
 	}
 	return st.scored(fallback, factor, now)
+}
+
+// scoreOf combines the policy's EWMA latency (seeded by URL test results) with
+// its loss and failure penalties.
+func (s *Smart) scoreOf(proxy C.Proxy, st *smartPolicyState, now time.Time) float64 {
+	return s.scoreOfSnapLocked(proxy.Name(), proxy.LastDelayForTestUrl(s.testUrl), st, now)
 }
 
 func (s *Smart) priorityFactor(name string) float64 {
@@ -969,6 +1712,9 @@ func (s *Smart) priorityFactor(name string) float64 {
 }
 
 func (s *Smart) stateOf(name string) *smartPolicyState {
+	if s.states == nil {
+		s.states = make(map[string]*smartPolicyState)
+	}
 	st, ok := s.states[name]
 	if !ok {
 		st = &smartPolicyState{}
@@ -983,9 +1729,10 @@ func (s *Smart) reportLatency(name string, metadata *C.Metadata, delayMs float64
 	if delayMs < smartMinScore {
 		delayMs = smartMinScore
 	}
-	// A response this late is more likely a slow endpoint or long-poll than a
-	// useful node-quality sample. Keep the site success, drop the score sample.
-	if delayMs <= smartMaxScore {
+	// A response slower than smartSampleCap (e.g. LLM thinking / long-poll) is
+	// more likely target server think time than node latency: keep site success
+	// but do not pollute the latency score.
+	if delayMs <= smartSampleCap {
 		s.stateOf(name).observeLatency(delayMs, now)
 	}
 	s.rememberSite(metadata, name, true, now)
@@ -999,11 +1746,11 @@ func (s *Smart) reportFailure(name string, metadata *C.Metadata) {
 	s.rememberSite(metadata, name, false, now)
 	s.invalidateRankCacheLocked()
 	s.mu.Unlock()
+	notifySmartSelectionChanged()
 }
 
 // invalidateRankCacheLocked forces the next connection to rebuild the ranking;
-// the caller must hold s.mu. Slow-moving samples (latency, loss) are left to the
-// TTL, so a burst of connections can still share one ranking.
+// the caller must hold s.mu (write lock).
 func (s *Smart) invalidateRankCacheLocked() {
 	s.rankGen++
 	s.rankCache = nil
@@ -1013,12 +1760,20 @@ func (s *Smart) reportRetransmit(name string, delta sockstat.TCPStats, baseOK bo
 	if !baseOK {
 		return
 	}
-	ratio, ok := delta.RetransmitRatio()
-	if !ok {
+	now := time.Now()
+	ratio, hasLoss := delta.RetransmitRatio()
+	hasRTT := delta.RTT > 0 || delta.RTTVar > 0
+	if !hasLoss && !hasRTT {
 		return
 	}
 	s.mu.Lock()
-	s.stateOf(name).observeLoss(ratio, time.Now())
+	st := s.stateOf(name)
+	if hasLoss {
+		st.observeLoss(ratio, now)
+	}
+	if hasRTT {
+		st.observeSocketRTT(delta.RTT, delta.RTTVar, now)
+	}
 	s.mu.Unlock()
 }
 
@@ -1048,11 +1803,14 @@ func (s *Smart) memoryKey(metadata *C.Metadata) string {
 }
 
 // rememberSite records the outcome that drives the group's site memory; the
-// caller must hold s.mu.
+// caller must hold s.mu (write lock).
 func (s *Smart) rememberSite(metadata *C.Metadata, name string, success bool, now time.Time) {
 	key := s.memoryKey(metadata)
 	if key == "" || name == "" {
 		return
+	}
+	if s.sites == nil {
+		s.sites = make(map[string]*smartSiteRecord)
 	}
 
 	record, ok := s.sites[key]
@@ -1081,7 +1839,7 @@ func (s *Smart) rememberSite(metadata *C.Metadata, name string, success bool, no
 }
 
 // pruneSites drops records untouched for the success TTL, expired per-proxy
-// entries, and records that became empty; the caller must hold s.mu.
+// entries, and records that became empty; the caller must hold s.mu (write lock).
 func (s *Smart) pruneSites(now time.Time) {
 	for key, record := range s.sites {
 		if !record.updated.IsZero() && now.Sub(record.updated) > smartSiteMemoryTTL {
@@ -1102,7 +1860,7 @@ func (s *Smart) pruneSites(now time.Time) {
 }
 
 // evictOldestSite drops the least-recently-updated record to make room for a
-// new site; the caller must hold s.mu.
+// new site; the caller must hold s.mu (write lock).
 func (s *Smart) evictOldestSite() {
 	oldestKey := ""
 	var oldest time.Time
@@ -1148,8 +1906,9 @@ func parsePolicyPriority(value string) ([]smartPriorityRule, error) {
 
 // smartConn wraps a member connection and feeds the group's scorer: it reports
 // the first-response latency on the first inbound byte, a failure when a request
-// was written but no data arrived, and the socket's retransmission counters
-// when it closes.
+// was written and went unanswered, and the socket's retransmission/RTT counters
+// when it closes. Once first write and first read complete, ReaderReplaceable
+// and WriterReplaceable let sing's bufio.Copy bypass this wrapper completely.
 type smartConn struct {
 	C.Conn
 
@@ -1159,15 +1918,16 @@ type smartConn struct {
 	dialDone    time.Time     // dial completion, the earliest point latency can start
 	dialLatency time.Duration // time spent in proxy.DialContext
 
-	writeMutex sync.Mutex
-	firstWrite time.Time // completion of the first outbound write
-	wroteData  atomic.Bool
+	firstWriteNano atomic.Int64 // UnixNano recorded right before the first outbound write
+	wroteData      atomic.Bool
 
-	base   sockstat.TCPStats
-	baseOK bool
+	sampler *sockstat.Sampler
+	base    sockstat.TCPStats
+	baseOK  bool
 
 	firstByteOnce sync.Once
 	gotData       atomic.Bool
+	readErr       atomic.Bool
 	closeOnce     sync.Once
 }
 
@@ -1180,14 +1940,21 @@ func newSmartConn(conn C.Conn, smart *Smart, proxyName string, metadata *C.Metad
 		dialDone:    dialDone,
 		dialLatency: dialLatency,
 	}
-	sc.base, sc.baseOK = sockstat.Sample(conn)
+	if sampler, ok := sockstat.Bind(conn); ok {
+		sc.sampler = sampler
+		sc.base, sc.baseOK = sampler.Sample()
+	}
 	return sc
 }
 
 func (c *smartConn) Read(b []byte) (int, error) {
 	n, err := c.Conn.Read(b)
 	if n > 0 {
-		c.markFirstByte()
+		if !c.gotData.Load() {
+			c.markFirstByte()
+		}
+	} else if err != nil && !errors.Is(err, io.EOF) {
+		c.readErr.Store(true)
 	}
 	return n, err
 }
@@ -1195,51 +1962,74 @@ func (c *smartConn) Read(b []byte) (int, error) {
 func (c *smartConn) ReadBuffer(buffer *buf.Buffer) error {
 	err := c.Conn.ReadBuffer(buffer)
 	if buffer.Len() > 0 {
-		c.markFirstByte()
+		if !c.gotData.Load() {
+			c.markFirstByte()
+		}
+	} else if err != nil && !errors.Is(err, io.EOF) {
+		c.readErr.Store(true)
 	}
 	return err
 }
 
 func (c *smartConn) Write(b []byte) (int, error) {
+	if c.wroteData.Load() {
+		return c.Conn.Write(b)
+	}
+	// Capture timestamp before the first write so EarlyConn handshake duration
+	// is included in first-response latency.
+	startNano := time.Now().UnixNano()
 	n, err := c.Conn.Write(b)
 	if n > 0 {
-		c.markWrite()
+		c.firstWriteNano.CompareAndSwap(0, startNano)
+		c.wroteData.Store(true)
 	}
 	return n, err
 }
 
 func (c *smartConn) WriteBuffer(buffer *buf.Buffer) error {
+	if c.wroteData.Load() {
+		return c.Conn.WriteBuffer(buffer)
+	}
 	size := buffer.Len()
+	startNano := time.Now().UnixNano()
 	err := c.Conn.WriteBuffer(buffer)
 	if err == nil && size > 0 {
-		c.markWrite()
+		c.firstWriteNano.CompareAndSwap(0, startNano)
+		c.wroteData.Store(true)
 	}
 	return err
 }
 
 func (c *smartConn) Close() error {
 	c.closeOnce.Do(func() {
-		// the socket must still be open to read its counters
-		if stats, ok := sockstat.Sample(c.Conn); ok {
-			c.smart.reportRetransmit(c.proxyName, stats.Sub(c.base), c.baseOK)
+		// Skip socket sampling on multiplexed/UDP transports where Bind failed.
+		if c.baseOK && c.sampler != nil {
+			if stats, ok := c.sampler.Sample(); ok {
+				c.smart.reportRetransmit(c.proxyName, stats.Sub(c.base), true)
+			}
 		}
-		// Only an unanswered request is evidence against the node: a connection
-		// closed before any write (browser preconnect, canceled request) says
-		// nothing about its health.
 		if c.wroteData.Load() && !c.gotData.Load() {
-			c.smart.reportFailure(c.proxyName, c.metadata)
+			if c.shouldReportUnanswered() {
+				c.smart.reportFailure(c.proxyName, c.metadata)
+			}
 		}
 	})
 	return c.Conn.Close()
 }
 
-func (c *smartConn) markWrite() {
-	c.writeMutex.Lock()
-	defer c.writeMutex.Unlock()
-	if c.firstWrite.IsZero() {
-		c.firstWrite = time.Now()
+func (c *smartConn) shouldReportUnanswered() bool {
+	if c.readErr.Load() {
+		return true
 	}
-	c.wroteData.Store(true)
+	minWait := smartUnansweredMinWait
+	if minWait <= 0 {
+		return true
+	}
+	firstNano := c.firstWriteNano.Load()
+	if firstNano <= 0 {
+		return false
+	}
+	return time.Since(time.Unix(0, firstNano)) >= minWait
 }
 
 // firstResponseDelay keeps real samples on the same basis as URLTest: the
@@ -1256,12 +2046,13 @@ func firstResponseDelay(base, firstByte time.Time, dialLatency time.Duration) ti
 func (c *smartConn) markFirstByte() {
 	c.firstByteOnce.Do(func() {
 		c.gotData.Store(true)
-		c.writeMutex.Lock()
 		base := c.dialDone
-		if c.firstWrite.After(base) {
-			base = c.firstWrite
+		if firstNano := c.firstWriteNano.Load(); firstNano > 0 {
+			firstWrite := time.Unix(0, firstNano)
+			if firstWrite.After(base) {
+				base = firstWrite
+			}
 		}
-		c.writeMutex.Unlock()
 		delayMs := float64(firstResponseDelay(base, time.Now(), c.dialLatency)) / float64(time.Millisecond)
 		c.smart.reportLatency(c.proxyName, c.metadata, delayMs)
 	})
@@ -1271,11 +2062,20 @@ func (c *smartConn) Upstream() any {
 	return c.Conn
 }
 
+func (c *smartConn) ReaderReplaceable() bool {
+	return c.gotData.Load()
+}
+
+func (c *smartConn) WriterReplaceable() bool {
+	return c.wroteData.Load()
+}
+
 var _ C.Conn = (*smartConn)(nil)
+var _ N.ExtendedConn = (*smartConn)(nil)
 
 // smartPacketConn wraps a member packet connection the way smartConn wraps a
 // TCP one: the first answered datagram feeds the latency scorer and the site
-// memory, and a session that wrote but never heard back counts as a node
+// memory, and a session that wrote and went unanswered counts as a node
 // failure. Retransmission counters are TCP-only and have no UDP equivalent.
 type smartPacketConn struct {
 	C.PacketConn
@@ -1287,12 +2087,12 @@ type smartPacketConn struct {
 	listenDone    time.Time     // listen completion, the earliest point latency can start
 	listenLatency time.Duration // time spent in proxy.ListenPacketContext
 
-	writeMutex sync.Mutex
-	firstWrite time.Time
-	wroteData  atomic.Bool
+	firstWriteNano atomic.Int64
+	wroteData      atomic.Bool
 
 	firstReadOnce sync.Once
 	gotData       atomic.Bool
+	readErr       atomic.Bool
 	closeOnce     sync.Once
 }
 
@@ -1310,7 +2110,11 @@ func newSmartPacketConn(pc C.PacketConn, smart *Smart, proxyName string, metadat
 func (c *smartPacketConn) ReadFrom(b []byte) (int, net.Addr, error) {
 	n, addr, err := c.PacketConn.ReadFrom(b)
 	if n > 0 {
-		c.markFirstRead()
+		if !c.gotData.Load() {
+			c.markFirstRead()
+		}
+	} else if err != nil && !errors.Is(err, io.EOF) {
+		c.readErr.Store(true)
 	}
 	return n, addr, err
 }
@@ -1318,48 +2122,64 @@ func (c *smartPacketConn) ReadFrom(b []byte) (int, net.Addr, error) {
 func (c *smartPacketConn) WaitReadFrom() ([]byte, func(), net.Addr, error) {
 	data, put, addr, err := c.PacketConn.WaitReadFrom()
 	if len(data) > 0 {
-		c.markFirstRead()
+		if !c.gotData.Load() {
+			c.markFirstRead()
+		}
+	} else if err != nil && !errors.Is(err, io.EOF) {
+		c.readErr.Store(true)
 	}
 	return data, put, addr, err
 }
 
 func (c *smartPacketConn) WriteTo(b []byte, addr net.Addr) (int, error) {
+	if c.wroteData.Load() {
+		return c.PacketConn.WriteTo(b, addr)
+	}
+	startNano := time.Now().UnixNano()
 	n, err := c.PacketConn.WriteTo(b, addr)
 	if n > 0 {
-		c.markWrite()
+		c.firstWriteNano.CompareAndSwap(0, startNano)
+		c.wroteData.Store(true)
 	}
 	return n, err
 }
 
 func (c *smartPacketConn) Close() error {
 	c.closeOnce.Do(func() {
-		// A session that wrote but never heard back is evidence against the
-		// node; a listener closed without any write says nothing about it.
 		if c.wroteData.Load() && !c.gotData.Load() {
-			c.smart.reportFailure(c.proxyName, c.metadata)
+			if c.shouldReportUnanswered() {
+				c.smart.reportFailure(c.proxyName, c.metadata)
+			}
 		}
 	})
 	return c.PacketConn.Close()
 }
 
-func (c *smartPacketConn) markWrite() {
-	c.writeMutex.Lock()
-	defer c.writeMutex.Unlock()
-	if c.firstWrite.IsZero() {
-		c.firstWrite = time.Now()
+func (c *smartPacketConn) shouldReportUnanswered() bool {
+	if c.readErr.Load() {
+		return true
 	}
-	c.wroteData.Store(true)
+	minWait := smartUnansweredMinWait
+	if minWait <= 0 {
+		return true
+	}
+	firstNano := c.firstWriteNano.Load()
+	if firstNano <= 0 {
+		return false
+	}
+	return time.Since(time.Unix(0, firstNano)) >= minWait
 }
 
 func (c *smartPacketConn) markFirstRead() {
 	c.firstReadOnce.Do(func() {
 		c.gotData.Store(true)
-		c.writeMutex.Lock()
 		base := c.listenDone
-		if c.firstWrite.After(base) {
-			base = c.firstWrite
+		if firstNano := c.firstWriteNano.Load(); firstNano > 0 {
+			firstWrite := time.Unix(0, firstNano)
+			if firstWrite.After(base) {
+				base = firstWrite
+			}
 		}
-		c.writeMutex.Unlock()
 		delayMs := float64(firstResponseDelay(base, time.Now(), c.listenLatency)) / float64(time.Millisecond)
 		c.smart.reportLatency(c.proxyName, c.metadata, delayMs)
 	})
@@ -1392,8 +2212,6 @@ func NewSmart(option GroupCommonOption, smartOption SmartOption, emptyFallback C
 	}
 	service, err := normalizeServiceName(smartOption.Service)
 	if err != nil {
-		// A published script can reach an older core before the next release; a
-		// typo must degrade to plain scoring instead of breaking the config.
 		log.Warnln("[Smart] %s: %v, service ranking disabled", option.Name, err)
 		service = ""
 	}
@@ -1402,7 +2220,12 @@ func NewSmart(option GroupCommonOption, smartOption SmartOption, emptyFallback C
 		log.Warnln("[Smart] %s: %v, pin stays on the group", option.Name, err)
 		pinSite = false
 	}
-	return &Smart{
+	interval := time.Duration(option.Interval) * time.Second
+	if interval <= 0 {
+		interval = 10 * time.Minute
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	s := &Smart{
 		GroupBase: NewGroupBase(GroupBaseOption{
 			Name:           option.Name,
 			Type:           C.Smart,
@@ -1419,12 +2242,20 @@ func NewSmart(option GroupCommonOption, smartOption SmartOption, emptyFallback C
 		disableUDP:     option.DisableUDP,
 		testUrl:        option.URL,
 		expectedStatus: option.ExpectedStatus,
+		interval:       interval,
+		ctx:            ctx,
+		cancel:         cancel,
 		states:         make(map[string]*smartPolicyState),
 		sites:          make(map[string]*smartSiteRecord),
 		priority:       priority,
+		priorityCache:  make(map[string]float64),
 		service:        service,
 		pinSite:        pinSite,
 		verdicts:       make(map[string]serviceVerdict),
 		attempts:       make(map[string]serviceProbeAttempt),
-	}, nil
+	}
+	if service != "" {
+		s.loadPersistedVerdicts(time.Now())
+	}
+	return s, nil
 }

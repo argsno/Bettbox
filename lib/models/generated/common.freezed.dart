@@ -4049,9 +4049,576 @@ as String?,
 
 
 /// @nodoc
+mixin _$SmartMemberInfo {
+
+ int get score; bool get verified; bool get blocked; String get region; bool get cooling;
+/// Create a copy of SmartMemberInfo
+/// with the given fields replaced by the non-null parameter values.
+@JsonKey(includeFromJson: false, includeToJson: false)
+@pragma('vm:prefer-inline')
+$SmartMemberInfoCopyWith<SmartMemberInfo> get copyWith => _$SmartMemberInfoCopyWithImpl<SmartMemberInfo>(this as SmartMemberInfo, _$identity);
+
+  /// Serializes this SmartMemberInfo to a JSON map.
+  Map<String, dynamic> toJson();
+
+
+@override
+bool operator ==(Object other) {
+  final _this = this as SmartMemberInfo;
+  return identical(this, other) || (other.runtimeType == runtimeType&&other is SmartMemberInfo&&(identical(other.score, _this.score) || other.score == _this.score)&&(identical(other.verified, _this.verified) || other.verified == _this.verified)&&(identical(other.blocked, _this.blocked) || other.blocked == _this.blocked)&&(identical(other.region, _this.region) || other.region == _this.region)&&(identical(other.cooling, _this.cooling) || other.cooling == _this.cooling));
+}
+
+@JsonKey(includeFromJson: false, includeToJson: false)
+@override
+int get hashCode {
+  final _this = this as SmartMemberInfo;
+  return Object.hash(runtimeType,_this.score,_this.verified,_this.blocked,_this.region,_this.cooling);
+}
+
+@override
+String toString() {
+  final _this = this as SmartMemberInfo;
+  return 'SmartMemberInfo(score: ${_this.score}, verified: ${_this.verified}, blocked: ${_this.blocked}, region: ${_this.region}, cooling: ${_this.cooling})';
+}
+
+
+}
+
+/// @nodoc
+abstract mixin class $SmartMemberInfoCopyWith<$Res>  {
+  factory $SmartMemberInfoCopyWith(SmartMemberInfo value, $Res Function(SmartMemberInfo) _then) = _$SmartMemberInfoCopyWithImpl;
+@useResult
+$Res call({
+ int score, bool verified, bool blocked, String region, bool cooling
+});
+
+
+
+
+}
+/// @nodoc
+class _$SmartMemberInfoCopyWithImpl<$Res>
+    implements $SmartMemberInfoCopyWith<$Res> {
+  _$SmartMemberInfoCopyWithImpl(this._self, this._then);
+
+  final SmartMemberInfo _self;
+  final $Res Function(SmartMemberInfo) _then;
+
+/// Create a copy of SmartMemberInfo
+/// with the given fields replaced by the non-null parameter values.
+@pragma('vm:prefer-inline') @override $Res call({Object? score = null,Object? verified = null,Object? blocked = null,Object? region = null,Object? cooling = null,}) {
+  return _then(SmartMemberInfo(
+score: null == score ? _self.score : score // ignore: cast_nullable_to_non_nullable
+as int,verified: null == verified ? _self.verified : verified // ignore: cast_nullable_to_non_nullable
+as bool,blocked: null == blocked ? _self.blocked : blocked // ignore: cast_nullable_to_non_nullable
+as bool,region: null == region ? _self.region : region // ignore: cast_nullable_to_non_nullable
+as String,cooling: null == cooling ? _self.cooling : cooling // ignore: cast_nullable_to_non_nullable
+as bool,
+  ));
+}
+
+}
+
+
+/// Adds pattern-matching-related methods to [SmartMemberInfo].
+extension SmartMemberInfoPatterns on SmartMemberInfo {
+/// A variant of `map` that fallback to returning `orElse`.
+///
+/// It is equivalent to doing:
+/// ```dart
+/// switch (sealedClass) {
+///   case final Subclass value:
+///     return ...;
+///   case _:
+///     return orElse();
+/// }
+/// ```
+
+@optionalTypeArgs TResult maybeMap<TResult extends Object?>(TResult Function( _SmartMemberInfo value)?  $default,{required TResult orElse(),}){
+final _that = this;
+switch (_that) {
+case _SmartMemberInfo() when $default != null:
+return $default(_that);case _:
+  return orElse();
+
+}
+}
+/// A `switch`-like method, using callbacks.
+///
+/// Callbacks receives the raw object, upcasted.
+/// It is equivalent to doing:
+/// ```dart
+/// switch (sealedClass) {
+///   case final Subclass value:
+///     return ...;
+///   case final Subclass2 value:
+///     return ...;
+/// }
+/// ```
+
+@optionalTypeArgs TResult map<TResult extends Object?>(TResult Function( _SmartMemberInfo value)  $default,){
+final _that = this;
+switch (_that) {
+case _SmartMemberInfo():
+return $default(_that);case _:
+  throw StateError('Unexpected subclass');
+
+}
+}
+/// A variant of `map` that fallback to returning `null`.
+///
+/// It is equivalent to doing:
+/// ```dart
+/// switch (sealedClass) {
+///   case final Subclass value:
+///     return ...;
+///   case _:
+///     return null;
+/// }
+/// ```
+
+@optionalTypeArgs TResult? mapOrNull<TResult extends Object?>(TResult? Function( _SmartMemberInfo value)?  $default,){
+final _that = this;
+switch (_that) {
+case _SmartMemberInfo() when $default != null:
+return $default(_that);case _:
+  return null;
+
+}
+}
+/// A variant of `when` that fallback to an `orElse` callback.
+///
+/// It is equivalent to doing:
+/// ```dart
+/// switch (sealedClass) {
+///   case Subclass(:final field):
+///     return ...;
+///   case _:
+///     return orElse();
+/// }
+/// ```
+
+@optionalTypeArgs TResult maybeWhen<TResult extends Object?>(TResult Function( int score,  bool verified,  bool blocked,  String region,  bool cooling)?  $default,{required TResult orElse(),}) {final _that = this;
+switch (_that) {
+case _SmartMemberInfo() when $default != null:
+return $default(_that.score,_that.verified,_that.blocked,_that.region,_that.cooling);case _:
+  return orElse();
+
+}
+}
+/// A `switch`-like method, using callbacks.
+///
+/// As opposed to `map`, this offers destructuring.
+/// It is equivalent to doing:
+/// ```dart
+/// switch (sealedClass) {
+///   case Subclass(:final field):
+///     return ...;
+///   case Subclass2(:final field2):
+///     return ...;
+/// }
+/// ```
+
+@optionalTypeArgs TResult when<TResult extends Object?>(TResult Function( int score,  bool verified,  bool blocked,  String region,  bool cooling)  $default,) {final _that = this;
+switch (_that) {
+case _SmartMemberInfo():
+return $default(_that.score,_that.verified,_that.blocked,_that.region,_that.cooling);case _:
+  throw StateError('Unexpected subclass');
+
+}
+}
+/// A variant of `when` that fallback to returning `null`
+///
+/// It is equivalent to doing:
+/// ```dart
+/// switch (sealedClass) {
+///   case Subclass(:final field):
+///     return ...;
+///   case _:
+///     return null;
+/// }
+/// ```
+
+@optionalTypeArgs TResult? whenOrNull<TResult extends Object?>(TResult? Function( int score,  bool verified,  bool blocked,  String region,  bool cooling)?  $default,) {final _that = this;
+switch (_that) {
+case _SmartMemberInfo() when $default != null:
+return $default(_that.score,_that.verified,_that.blocked,_that.region,_that.cooling);case _:
+  return null;
+
+}
+}
+
+}
+
+/// @nodoc
+@JsonSerializable()
+
+class _SmartMemberInfo implements SmartMemberInfo {
+  const _SmartMemberInfo({this.score = 0, this.verified = false, this.blocked = false, this.region = '', this.cooling = false});
+  factory _SmartMemberInfo.fromJson(Map<String, dynamic> json) => _$SmartMemberInfoFromJson(json);
+
+@override@JsonKey() final  int score;
+@override@JsonKey() final  bool verified;
+@override@JsonKey() final  bool blocked;
+@override@JsonKey() final  String region;
+@override@JsonKey() final  bool cooling;
+
+/// Create a copy of SmartMemberInfo
+/// with the given fields replaced by the non-null parameter values.
+@override @JsonKey(includeFromJson: false, includeToJson: false)
+@pragma('vm:prefer-inline')
+_$SmartMemberInfoCopyWith<_SmartMemberInfo> get copyWith => __$SmartMemberInfoCopyWithImpl<_SmartMemberInfo>(this, _$identity);
+
+@override
+Map<String, dynamic> toJson() {
+  return _$SmartMemberInfoToJson(this, );
+}
+
+@override
+bool operator ==(Object other) {
+    return identical(this, other) || (other.runtimeType == runtimeType&&other is _SmartMemberInfo&&(identical(other.score, score) || other.score == score)&&(identical(other.verified, verified) || other.verified == verified)&&(identical(other.blocked, blocked) || other.blocked == blocked)&&(identical(other.region, region) || other.region == region)&&(identical(other.cooling, cooling) || other.cooling == cooling));
+}
+
+@JsonKey(includeFromJson: false, includeToJson: false)
+@override
+int get hashCode {
+    return Object.hash(runtimeType,score,verified,blocked,region,cooling);
+}
+
+@override
+String toString() {
+    return 'SmartMemberInfo(score: $score, verified: $verified, blocked: $blocked, region: $region, cooling: $cooling)';
+}
+
+
+}
+
+/// @nodoc
+abstract mixin class _$SmartMemberInfoCopyWith<$Res> implements $SmartMemberInfoCopyWith<$Res> {
+  factory _$SmartMemberInfoCopyWith(_SmartMemberInfo value, $Res Function(_SmartMemberInfo) _then) = __$SmartMemberInfoCopyWithImpl;
+@override @useResult
+$Res call({
+ int score, bool verified, bool blocked, String region, bool cooling
+});
+
+
+
+
+}
+/// @nodoc
+class __$SmartMemberInfoCopyWithImpl<$Res>
+    implements _$SmartMemberInfoCopyWith<$Res> {
+  __$SmartMemberInfoCopyWithImpl(this._self, this._then);
+
+  final _SmartMemberInfo _self;
+  final $Res Function(_SmartMemberInfo) _then;
+
+/// Create a copy of SmartMemberInfo
+/// with the given fields replaced by the non-null parameter values.
+@override @pragma('vm:prefer-inline') $Res call({Object? score = null,Object? verified = null,Object? blocked = null,Object? region = null,Object? cooling = null,}) {
+  return _then(_SmartMemberInfo(
+score: null == score ? _self.score : score // ignore: cast_nullable_to_non_nullable
+as int,verified: null == verified ? _self.verified : verified // ignore: cast_nullable_to_non_nullable
+as bool,blocked: null == blocked ? _self.blocked : blocked // ignore: cast_nullable_to_non_nullable
+as bool,region: null == region ? _self.region : region // ignore: cast_nullable_to_non_nullable
+as String,cooling: null == cooling ? _self.cooling : cooling // ignore: cast_nullable_to_non_nullable
+as bool,
+  ));
+}
+
+
+}
+
+
+/// @nodoc
+mixin _$SmartGroupInfo {
+
+ String get service; String get pin; bool get probing; Map<String, SmartMemberInfo> get members;
+/// Create a copy of SmartGroupInfo
+/// with the given fields replaced by the non-null parameter values.
+@JsonKey(includeFromJson: false, includeToJson: false)
+@pragma('vm:prefer-inline')
+$SmartGroupInfoCopyWith<SmartGroupInfo> get copyWith => _$SmartGroupInfoCopyWithImpl<SmartGroupInfo>(this as SmartGroupInfo, _$identity);
+
+  /// Serializes this SmartGroupInfo to a JSON map.
+  Map<String, dynamic> toJson();
+
+
+@override
+bool operator ==(Object other) {
+  final _this = this as SmartGroupInfo;
+  return identical(this, other) || (other.runtimeType == runtimeType&&other is SmartGroupInfo&&(identical(other.service, _this.service) || other.service == _this.service)&&(identical(other.pin, _this.pin) || other.pin == _this.pin)&&(identical(other.probing, _this.probing) || other.probing == _this.probing)&&const DeepCollectionEquality().equals(other.members, _this.members));
+}
+
+@JsonKey(includeFromJson: false, includeToJson: false)
+@override
+int get hashCode {
+  final _this = this as SmartGroupInfo;
+  return Object.hash(runtimeType,_this.service,_this.pin,_this.probing,const DeepCollectionEquality().hash(_this.members));
+}
+
+@override
+String toString() {
+  final _this = this as SmartGroupInfo;
+  return 'SmartGroupInfo(service: ${_this.service}, pin: ${_this.pin}, probing: ${_this.probing}, members: ${_this.members})';
+}
+
+
+}
+
+/// @nodoc
+abstract mixin class $SmartGroupInfoCopyWith<$Res>  {
+  factory $SmartGroupInfoCopyWith(SmartGroupInfo value, $Res Function(SmartGroupInfo) _then) = _$SmartGroupInfoCopyWithImpl;
+@useResult
+$Res call({
+ String service, String pin, bool probing, Map<String, SmartMemberInfo> members
+});
+
+
+
+
+}
+/// @nodoc
+class _$SmartGroupInfoCopyWithImpl<$Res>
+    implements $SmartGroupInfoCopyWith<$Res> {
+  _$SmartGroupInfoCopyWithImpl(this._self, this._then);
+
+  final SmartGroupInfo _self;
+  final $Res Function(SmartGroupInfo) _then;
+
+/// Create a copy of SmartGroupInfo
+/// with the given fields replaced by the non-null parameter values.
+@pragma('vm:prefer-inline') @override $Res call({Object? service = null,Object? pin = null,Object? probing = null,Object? members = null,}) {
+  return _then(SmartGroupInfo(
+service: null == service ? _self.service : service // ignore: cast_nullable_to_non_nullable
+as String,pin: null == pin ? _self.pin : pin // ignore: cast_nullable_to_non_nullable
+as String,probing: null == probing ? _self.probing : probing // ignore: cast_nullable_to_non_nullable
+as bool,members: null == members ? _self.members : members // ignore: cast_nullable_to_non_nullable
+as Map<String, SmartMemberInfo>,
+  ));
+}
+
+}
+
+
+/// Adds pattern-matching-related methods to [SmartGroupInfo].
+extension SmartGroupInfoPatterns on SmartGroupInfo {
+/// A variant of `map` that fallback to returning `orElse`.
+///
+/// It is equivalent to doing:
+/// ```dart
+/// switch (sealedClass) {
+///   case final Subclass value:
+///     return ...;
+///   case _:
+///     return orElse();
+/// }
+/// ```
+
+@optionalTypeArgs TResult maybeMap<TResult extends Object?>(TResult Function( _SmartGroupInfo value)?  $default,{required TResult orElse(),}){
+final _that = this;
+switch (_that) {
+case _SmartGroupInfo() when $default != null:
+return $default(_that);case _:
+  return orElse();
+
+}
+}
+/// A `switch`-like method, using callbacks.
+///
+/// Callbacks receives the raw object, upcasted.
+/// It is equivalent to doing:
+/// ```dart
+/// switch (sealedClass) {
+///   case final Subclass value:
+///     return ...;
+///   case final Subclass2 value:
+///     return ...;
+/// }
+/// ```
+
+@optionalTypeArgs TResult map<TResult extends Object?>(TResult Function( _SmartGroupInfo value)  $default,){
+final _that = this;
+switch (_that) {
+case _SmartGroupInfo():
+return $default(_that);case _:
+  throw StateError('Unexpected subclass');
+
+}
+}
+/// A variant of `map` that fallback to returning `null`.
+///
+/// It is equivalent to doing:
+/// ```dart
+/// switch (sealedClass) {
+///   case final Subclass value:
+///     return ...;
+///   case _:
+///     return null;
+/// }
+/// ```
+
+@optionalTypeArgs TResult? mapOrNull<TResult extends Object?>(TResult? Function( _SmartGroupInfo value)?  $default,){
+final _that = this;
+switch (_that) {
+case _SmartGroupInfo() when $default != null:
+return $default(_that);case _:
+  return null;
+
+}
+}
+/// A variant of `when` that fallback to an `orElse` callback.
+///
+/// It is equivalent to doing:
+/// ```dart
+/// switch (sealedClass) {
+///   case Subclass(:final field):
+///     return ...;
+///   case _:
+///     return orElse();
+/// }
+/// ```
+
+@optionalTypeArgs TResult maybeWhen<TResult extends Object?>(TResult Function( String service,  String pin,  bool probing,  Map<String, SmartMemberInfo> members)?  $default,{required TResult orElse(),}) {final _that = this;
+switch (_that) {
+case _SmartGroupInfo() when $default != null:
+return $default(_that.service,_that.pin,_that.probing,_that.members);case _:
+  return orElse();
+
+}
+}
+/// A `switch`-like method, using callbacks.
+///
+/// As opposed to `map`, this offers destructuring.
+/// It is equivalent to doing:
+/// ```dart
+/// switch (sealedClass) {
+///   case Subclass(:final field):
+///     return ...;
+///   case Subclass2(:final field2):
+///     return ...;
+/// }
+/// ```
+
+@optionalTypeArgs TResult when<TResult extends Object?>(TResult Function( String service,  String pin,  bool probing,  Map<String, SmartMemberInfo> members)  $default,) {final _that = this;
+switch (_that) {
+case _SmartGroupInfo():
+return $default(_that.service,_that.pin,_that.probing,_that.members);case _:
+  throw StateError('Unexpected subclass');
+
+}
+}
+/// A variant of `when` that fallback to returning `null`
+///
+/// It is equivalent to doing:
+/// ```dart
+/// switch (sealedClass) {
+///   case Subclass(:final field):
+///     return ...;
+///   case _:
+///     return null;
+/// }
+/// ```
+
+@optionalTypeArgs TResult? whenOrNull<TResult extends Object?>(TResult? Function( String service,  String pin,  bool probing,  Map<String, SmartMemberInfo> members)?  $default,) {final _that = this;
+switch (_that) {
+case _SmartGroupInfo() when $default != null:
+return $default(_that.service,_that.pin,_that.probing,_that.members);case _:
+  return null;
+
+}
+}
+
+}
+
+/// @nodoc
+@JsonSerializable()
+
+class _SmartGroupInfo implements SmartGroupInfo {
+  const _SmartGroupInfo({this.service = '', this.pin = '', this.probing = false,  Map<String, SmartMemberInfo> members = const {}}): _members = members;
+  factory _SmartGroupInfo.fromJson(Map<String, dynamic> json) => _$SmartGroupInfoFromJson(json);
+
+@override@JsonKey() final  String service;
+@override@JsonKey() final  String pin;
+@override@JsonKey() final  bool probing;
+ final  Map<String, SmartMemberInfo> _members;
+@override@JsonKey() Map<String, SmartMemberInfo> get members {
+  if (_members is EqualUnmodifiableMapView) return _members;
+  // ignore: implicit_dynamic_type
+  return EqualUnmodifiableMapView(_members);
+}
+
+
+/// Create a copy of SmartGroupInfo
+/// with the given fields replaced by the non-null parameter values.
+@override @JsonKey(includeFromJson: false, includeToJson: false)
+@pragma('vm:prefer-inline')
+_$SmartGroupInfoCopyWith<_SmartGroupInfo> get copyWith => __$SmartGroupInfoCopyWithImpl<_SmartGroupInfo>(this, _$identity);
+
+@override
+Map<String, dynamic> toJson() {
+  return _$SmartGroupInfoToJson(this, );
+}
+
+@override
+bool operator ==(Object other) {
+    return identical(this, other) || (other.runtimeType == runtimeType&&other is _SmartGroupInfo&&(identical(other.service, service) || other.service == service)&&(identical(other.pin, pin) || other.pin == pin)&&(identical(other.probing, probing) || other.probing == probing)&&const DeepCollectionEquality().equals(other.members, _members));
+}
+
+@JsonKey(includeFromJson: false, includeToJson: false)
+@override
+int get hashCode {
+    return Object.hash(runtimeType,service,pin,probing,const DeepCollectionEquality().hash(_members));
+}
+
+@override
+String toString() {
+    return 'SmartGroupInfo(service: $service, pin: $pin, probing: $probing, members: $members)';
+}
+
+
+}
+
+/// @nodoc
+abstract mixin class _$SmartGroupInfoCopyWith<$Res> implements $SmartGroupInfoCopyWith<$Res> {
+  factory _$SmartGroupInfoCopyWith(_SmartGroupInfo value, $Res Function(_SmartGroupInfo) _then) = __$SmartGroupInfoCopyWithImpl;
+@override @useResult
+$Res call({
+ String service, String pin, bool probing, Map<String, SmartMemberInfo> members
+});
+
+
+
+
+}
+/// @nodoc
+class __$SmartGroupInfoCopyWithImpl<$Res>
+    implements _$SmartGroupInfoCopyWith<$Res> {
+  __$SmartGroupInfoCopyWithImpl(this._self, this._then);
+
+  final _SmartGroupInfo _self;
+  final $Res Function(_SmartGroupInfo) _then;
+
+/// Create a copy of SmartGroupInfo
+/// with the given fields replaced by the non-null parameter values.
+@override @pragma('vm:prefer-inline') $Res call({Object? service = null,Object? pin = null,Object? probing = null,Object? members = null,}) {
+  return _then(_SmartGroupInfo(
+service: null == service ? _self.service : service // ignore: cast_nullable_to_non_nullable
+as String,pin: null == pin ? _self.pin : pin // ignore: cast_nullable_to_non_nullable
+as String,probing: null == probing ? _self.probing : probing // ignore: cast_nullable_to_non_nullable
+as bool,members: null == members ? _self._members : members // ignore: cast_nullable_to_non_nullable
+as Map<String, SmartMemberInfo>,
+  ));
+}
+
+
+}
+
+
+/// @nodoc
 mixin _$Group {
 
- GroupType get type; List<Proxy> get all; String? get now; bool? get hidden; String? get testUrl; String get icon; String get name;
+ GroupType get type; List<Proxy> get all; String? get now; bool? get hidden; String? get testUrl; String get icon; String get name; SmartGroupInfo? get smart;
 /// Create a copy of Group
 /// with the given fields replaced by the non-null parameter values.
 @JsonKey(includeFromJson: false, includeToJson: false)
@@ -4065,20 +4632,20 @@ $GroupCopyWith<Group> get copyWith => _$GroupCopyWithImpl<Group>(this as Group, 
 @override
 bool operator ==(Object other) {
   final _this = this as Group;
-  return identical(this, other) || (other.runtimeType == runtimeType&&other is Group&&(identical(other.type, _this.type) || other.type == _this.type)&&const DeepCollectionEquality().equals(other.all, _this.all)&&(identical(other.now, _this.now) || other.now == _this.now)&&(identical(other.hidden, _this.hidden) || other.hidden == _this.hidden)&&(identical(other.testUrl, _this.testUrl) || other.testUrl == _this.testUrl)&&(identical(other.icon, _this.icon) || other.icon == _this.icon)&&(identical(other.name, _this.name) || other.name == _this.name));
+  return identical(this, other) || (other.runtimeType == runtimeType&&other is Group&&(identical(other.type, _this.type) || other.type == _this.type)&&const DeepCollectionEquality().equals(other.all, _this.all)&&(identical(other.now, _this.now) || other.now == _this.now)&&(identical(other.hidden, _this.hidden) || other.hidden == _this.hidden)&&(identical(other.testUrl, _this.testUrl) || other.testUrl == _this.testUrl)&&(identical(other.icon, _this.icon) || other.icon == _this.icon)&&(identical(other.name, _this.name) || other.name == _this.name)&&(identical(other.smart, _this.smart) || other.smart == _this.smart));
 }
 
 @JsonKey(includeFromJson: false, includeToJson: false)
 @override
 int get hashCode {
   final _this = this as Group;
-  return Object.hash(runtimeType,_this.type,const DeepCollectionEquality().hash(_this.all),_this.now,_this.hidden,_this.testUrl,_this.icon,_this.name);
+  return Object.hash(runtimeType,_this.type,const DeepCollectionEquality().hash(_this.all),_this.now,_this.hidden,_this.testUrl,_this.icon,_this.name,_this.smart);
 }
 
 @override
 String toString() {
   final _this = this as Group;
-  return 'Group(type: ${_this.type}, all: ${_this.all}, now: ${_this.now}, hidden: ${_this.hidden}, testUrl: ${_this.testUrl}, icon: ${_this.icon}, name: ${_this.name})';
+  return 'Group(type: ${_this.type}, all: ${_this.all}, now: ${_this.now}, hidden: ${_this.hidden}, testUrl: ${_this.testUrl}, icon: ${_this.icon}, name: ${_this.name}, smart: ${_this.smart})';
 }
 
 
@@ -4089,11 +4656,11 @@ abstract mixin class $GroupCopyWith<$Res>  {
   factory $GroupCopyWith(Group value, $Res Function(Group) _then) = _$GroupCopyWithImpl;
 @useResult
 $Res call({
- GroupType type, List<Proxy> all, String? now, bool? hidden, String? testUrl, String icon, String name
+ GroupType type, List<Proxy> all, String? now, bool? hidden, String? testUrl, String icon, String name, SmartGroupInfo? smart
 });
 
 
-
+$SmartGroupInfoCopyWith<$Res>? get smart;
 
 }
 /// @nodoc
@@ -4106,7 +4673,7 @@ class _$GroupCopyWithImpl<$Res>
 
 /// Create a copy of Group
 /// with the given fields replaced by the non-null parameter values.
-@pragma('vm:prefer-inline') @override $Res call({Object? type = null,Object? all = null,Object? now = freezed,Object? hidden = freezed,Object? testUrl = freezed,Object? icon = null,Object? name = null,}) {
+@pragma('vm:prefer-inline') @override $Res call({Object? type = null,Object? all = null,Object? now = freezed,Object? hidden = freezed,Object? testUrl = freezed,Object? icon = null,Object? name = null,Object? smart = freezed,}) {
   return _then(Group(
 type: null == type ? _self.type : type // ignore: cast_nullable_to_non_nullable
 as GroupType,all: null == all ? _self.all : all // ignore: cast_nullable_to_non_nullable
@@ -4115,10 +4682,23 @@ as String?,hidden: freezed == hidden ? _self.hidden : hidden // ignore: cast_nul
 as bool?,testUrl: freezed == testUrl ? _self.testUrl : testUrl // ignore: cast_nullable_to_non_nullable
 as String?,icon: null == icon ? _self.icon : icon // ignore: cast_nullable_to_non_nullable
 as String,name: null == name ? _self.name : name // ignore: cast_nullable_to_non_nullable
-as String,
+as String,smart: freezed == smart ? _self.smart : smart // ignore: cast_nullable_to_non_nullable
+as SmartGroupInfo?,
   ));
 }
+/// Create a copy of Group
+/// with the given fields replaced by the non-null parameter values.
+@override
+@pragma('vm:prefer-inline')
+$SmartGroupInfoCopyWith<$Res>? get smart {
+    if (_self.smart == null) {
+    return null;
+  }
 
+  return $SmartGroupInfoCopyWith<$Res>(_self.smart!, (value) {
+    return _then(_self.copyWith(smart: value));
+  });
+}
 }
 
 
@@ -4200,10 +4780,10 @@ return $default(_that);case _:
 /// }
 /// ```
 
-@optionalTypeArgs TResult maybeWhen<TResult extends Object?>(TResult Function( GroupType type,  List<Proxy> all,  String? now,  bool? hidden,  String? testUrl,  String icon,  String name)?  $default,{required TResult orElse(),}) {final _that = this;
+@optionalTypeArgs TResult maybeWhen<TResult extends Object?>(TResult Function( GroupType type,  List<Proxy> all,  String? now,  bool? hidden,  String? testUrl,  String icon,  String name,  SmartGroupInfo? smart)?  $default,{required TResult orElse(),}) {final _that = this;
 switch (_that) {
 case _Group() when $default != null:
-return $default(_that.type,_that.all,_that.now,_that.hidden,_that.testUrl,_that.icon,_that.name);case _:
+return $default(_that.type,_that.all,_that.now,_that.hidden,_that.testUrl,_that.icon,_that.name,_that.smart);case _:
   return orElse();
 
 }
@@ -4221,10 +4801,10 @@ return $default(_that.type,_that.all,_that.now,_that.hidden,_that.testUrl,_that.
 /// }
 /// ```
 
-@optionalTypeArgs TResult when<TResult extends Object?>(TResult Function( GroupType type,  List<Proxy> all,  String? now,  bool? hidden,  String? testUrl,  String icon,  String name)  $default,) {final _that = this;
+@optionalTypeArgs TResult when<TResult extends Object?>(TResult Function( GroupType type,  List<Proxy> all,  String? now,  bool? hidden,  String? testUrl,  String icon,  String name,  SmartGroupInfo? smart)  $default,) {final _that = this;
 switch (_that) {
 case _Group():
-return $default(_that.type,_that.all,_that.now,_that.hidden,_that.testUrl,_that.icon,_that.name);case _:
+return $default(_that.type,_that.all,_that.now,_that.hidden,_that.testUrl,_that.icon,_that.name,_that.smart);case _:
   throw StateError('Unexpected subclass');
 
 }
@@ -4241,10 +4821,10 @@ return $default(_that.type,_that.all,_that.now,_that.hidden,_that.testUrl,_that.
 /// }
 /// ```
 
-@optionalTypeArgs TResult? whenOrNull<TResult extends Object?>(TResult? Function( GroupType type,  List<Proxy> all,  String? now,  bool? hidden,  String? testUrl,  String icon,  String name)?  $default,) {final _that = this;
+@optionalTypeArgs TResult? whenOrNull<TResult extends Object?>(TResult? Function( GroupType type,  List<Proxy> all,  String? now,  bool? hidden,  String? testUrl,  String icon,  String name,  SmartGroupInfo? smart)?  $default,) {final _that = this;
 switch (_that) {
 case _Group() when $default != null:
-return $default(_that.type,_that.all,_that.now,_that.hidden,_that.testUrl,_that.icon,_that.name);case _:
+return $default(_that.type,_that.all,_that.now,_that.hidden,_that.testUrl,_that.icon,_that.name,_that.smart);case _:
   return null;
 
 }
@@ -4256,7 +4836,7 @@ return $default(_that.type,_that.all,_that.now,_that.hidden,_that.testUrl,_that.
 @JsonSerializable()
 
 class _Group implements Group {
-  const _Group({required this.type,  List<Proxy> all = const [], this.now, this.hidden, this.testUrl, this.icon = '', required this.name}): _all = all;
+  const _Group({required this.type,  List<Proxy> all = const [], this.now, this.hidden, this.testUrl, this.icon = '', required this.name, this.smart}): _all = all;
   factory _Group.fromJson(Map<String, dynamic> json) => _$GroupFromJson(json);
 
 @override final  GroupType type;
@@ -4272,6 +4852,7 @@ class _Group implements Group {
 @override final  String? testUrl;
 @override@JsonKey() final  String icon;
 @override final  String name;
+@override final  SmartGroupInfo? smart;
 
 /// Create a copy of Group
 /// with the given fields replaced by the non-null parameter values.
@@ -4286,18 +4867,18 @@ Map<String, dynamic> toJson() {
 
 @override
 bool operator ==(Object other) {
-    return identical(this, other) || (other.runtimeType == runtimeType&&other is _Group&&(identical(other.type, type) || other.type == type)&&const DeepCollectionEquality().equals(other.all, _all)&&(identical(other.now, now) || other.now == now)&&(identical(other.hidden, hidden) || other.hidden == hidden)&&(identical(other.testUrl, testUrl) || other.testUrl == testUrl)&&(identical(other.icon, icon) || other.icon == icon)&&(identical(other.name, name) || other.name == name));
+    return identical(this, other) || (other.runtimeType == runtimeType&&other is _Group&&(identical(other.type, type) || other.type == type)&&const DeepCollectionEquality().equals(other.all, _all)&&(identical(other.now, now) || other.now == now)&&(identical(other.hidden, hidden) || other.hidden == hidden)&&(identical(other.testUrl, testUrl) || other.testUrl == testUrl)&&(identical(other.icon, icon) || other.icon == icon)&&(identical(other.name, name) || other.name == name)&&(identical(other.smart, smart) || other.smart == smart));
 }
 
 @JsonKey(includeFromJson: false, includeToJson: false)
 @override
 int get hashCode {
-    return Object.hash(runtimeType,type,const DeepCollectionEquality().hash(_all),now,hidden,testUrl,icon,name);
+    return Object.hash(runtimeType,type,const DeepCollectionEquality().hash(_all),now,hidden,testUrl,icon,name,smart);
 }
 
 @override
 String toString() {
-    return 'Group(type: $type, all: $all, now: $now, hidden: $hidden, testUrl: $testUrl, icon: $icon, name: $name)';
+    return 'Group(type: $type, all: $all, now: $now, hidden: $hidden, testUrl: $testUrl, icon: $icon, name: $name, smart: $smart)';
 }
 
 
@@ -4308,11 +4889,11 @@ abstract mixin class _$GroupCopyWith<$Res> implements $GroupCopyWith<$Res> {
   factory _$GroupCopyWith(_Group value, $Res Function(_Group) _then) = __$GroupCopyWithImpl;
 @override @useResult
 $Res call({
- GroupType type, List<Proxy> all, String? now, bool? hidden, String? testUrl, String icon, String name
+ GroupType type, List<Proxy> all, String? now, bool? hidden, String? testUrl, String icon, String name, SmartGroupInfo? smart
 });
 
 
-
+@override $SmartGroupInfoCopyWith<$Res>? get smart;
 
 }
 /// @nodoc
@@ -4325,7 +4906,7 @@ class __$GroupCopyWithImpl<$Res>
 
 /// Create a copy of Group
 /// with the given fields replaced by the non-null parameter values.
-@override @pragma('vm:prefer-inline') $Res call({Object? type = null,Object? all = null,Object? now = freezed,Object? hidden = freezed,Object? testUrl = freezed,Object? icon = null,Object? name = null,}) {
+@override @pragma('vm:prefer-inline') $Res call({Object? type = null,Object? all = null,Object? now = freezed,Object? hidden = freezed,Object? testUrl = freezed,Object? icon = null,Object? name = null,Object? smart = freezed,}) {
   return _then(_Group(
 type: null == type ? _self.type : type // ignore: cast_nullable_to_non_nullable
 as GroupType,all: null == all ? _self._all : all // ignore: cast_nullable_to_non_nullable
@@ -4334,11 +4915,24 @@ as String?,hidden: freezed == hidden ? _self.hidden : hidden // ignore: cast_nul
 as bool?,testUrl: freezed == testUrl ? _self.testUrl : testUrl // ignore: cast_nullable_to_non_nullable
 as String?,icon: null == icon ? _self.icon : icon // ignore: cast_nullable_to_non_nullable
 as String,name: null == name ? _self.name : name // ignore: cast_nullable_to_non_nullable
-as String,
+as String,smart: freezed == smart ? _self.smart : smart // ignore: cast_nullable_to_non_nullable
+as SmartGroupInfo?,
   ));
 }
 
+/// Create a copy of Group
+/// with the given fields replaced by the non-null parameter values.
+@override
+@pragma('vm:prefer-inline')
+$SmartGroupInfoCopyWith<$Res>? get smart {
+    if (_self.smart == null) {
+    return null;
+  }
 
+  return $SmartGroupInfoCopyWith<$Res>(_self.smart!, (value) {
+    return _then(_self.copyWith(smart: value));
+  });
+}
 }
 
 /// @nodoc

@@ -309,7 +309,19 @@ func updateHosts(tree *trie.DomainTrie[resolver.HostValue]) {
 }
 
 func updateProxies(proxies map[string]C.Proxy, providers map[string]P.ProxyProvider) {
-	tunnel.UpdateProxies(proxies, providers)
+	oldProxies, _ := tunnel.UpdateProxies(proxies, providers)
+	for name, oldProxy := range oldProxies {
+		oldSmart, ok := oldProxy.Adapter().(*outboundgroup.Smart)
+		if !ok {
+			continue
+		}
+		if newProxy, exists := proxies[name]; exists {
+			if newSmart, ok := newProxy.Adapter().(*outboundgroup.Smart); ok {
+				newSmart.ImportStateFrom(oldSmart)
+			}
+		}
+		_ = oldSmart.Close()
+	}
 }
 
 func updateRules(rules []C.Rule, subRules map[string][]C.Rule, ruleProviders map[string]P.RuleProvider) {
@@ -463,7 +475,7 @@ func patchSelectGroup(proxies map[string]C.Proxy) {
 			continue
 		}
 
-		if outbound.Type() == C.URLTest {
+		if outbound.Type() == C.URLTest || outbound.Type() == C.Smart {
 			cachefile.Cache().SetSelected(name, "")
 			selector.ForceSet("")
 			continue

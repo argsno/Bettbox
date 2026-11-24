@@ -209,6 +209,47 @@ Map<String, dynamic> _$ProxyToJson(_Proxy instance) => <String, dynamic>{
   'now': instance.now,
 };
 
+_SmartMemberInfo _$SmartMemberInfoFromJson(Map<String, dynamic> json) =>
+    _SmartMemberInfo(
+      score: (json['score'] as num?)?.toInt() ?? 0,
+      verified: json['verified'] as bool? ?? false,
+      blocked: json['blocked'] as bool? ?? false,
+      region: json['region'] as String? ?? '',
+      cooling: json['cooling'] as bool? ?? false,
+    );
+
+Map<String, dynamic> _$SmartMemberInfoToJson(_SmartMemberInfo instance) =>
+    <String, dynamic>{
+      'score': instance.score,
+      'verified': instance.verified,
+      'blocked': instance.blocked,
+      'region': instance.region,
+      'cooling': instance.cooling,
+    };
+
+_SmartGroupInfo _$SmartGroupInfoFromJson(Map<String, dynamic> json) =>
+    _SmartGroupInfo(
+      service: json['service'] as String? ?? '',
+      pin: json['pin'] as String? ?? '',
+      probing: json['probing'] as bool? ?? false,
+      members:
+          (json['members'] as Map<String, dynamic>?)?.map(
+            (k, e) => MapEntry(
+              k,
+              SmartMemberInfo.fromJson(e as Map<String, dynamic>),
+            ),
+          ) ??
+          const {},
+    );
+
+Map<String, dynamic> _$SmartGroupInfoToJson(_SmartGroupInfo instance) =>
+    <String, dynamic>{
+      'service': instance.service,
+      'pin': instance.pin,
+      'probing': instance.probing,
+      'members': instance.members,
+    };
+
 _Group _$GroupFromJson(Map<String, dynamic> json) => _Group(
   type: $enumDecode(_$GroupTypeEnumMap, json['type']),
   all:
@@ -221,6 +262,9 @@ _Group _$GroupFromJson(Map<String, dynamic> json) => _Group(
   testUrl: json['testUrl'] as String?,
   icon: json['icon'] as String? ?? '',
   name: json['name'] as String,
+  smart: json['smart'] == null
+      ? null
+      : SmartGroupInfo.fromJson(json['smart'] as Map<String, dynamic>),
 );
 
 Map<String, dynamic> _$GroupToJson(_Group instance) => <String, dynamic>{
@@ -231,6 +275,7 @@ Map<String, dynamic> _$GroupToJson(_Group instance) => <String, dynamic>{
   'testUrl': instance.testUrl,
   'icon': instance.icon,
   'name': instance.name,
+  'smart': instance.smart,
 };
 
 const _$GroupTypeEnumMap = {

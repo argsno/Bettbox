@@ -191,13 +191,14 @@ type proxiesPayload struct {
 }
 
 type groupPayload struct {
-	Name    string  `json:"name"`
-	Type    string  `json:"type"`
-	Now     *string `json:"now,omitempty"`
-	TestUrl *string `json:"testUrl,omitempty"`
-	Hidden  bool    `json:"hidden"`
-	Icon    string  `json:"icon"`
-	All     []int   `json:"all"`
+	Name    string                       `json:"name"`
+	Type    string                       `json:"type"`
+	Now     *string                      `json:"now,omitempty"`
+	TestUrl *string                      `json:"testUrl,omitempty"`
+	Hidden  bool                         `json:"hidden"`
+	Icon    string                       `json:"icon"`
+	All     []int                        `json:"all"`
+	Smart   *outboundgroup.SmartSnapshot `json:"smart,omitempty"`
 }
 
 type groupShape struct {
@@ -321,6 +322,10 @@ func marshalProxies(proxies map[string]constant.Proxy) ([]byte, error) {
 			now := group.Now()
 			item.Now = &now
 			nows[name] = now
+		}
+		if smart, ok := group.(*outboundgroup.Smart); ok {
+			snap := smart.Snapshot()
+			item.Smart = &snap
 		}
 		for i, member := range members {
 			item.All[i] = indexOf(member)
@@ -1431,6 +1436,9 @@ func handleSuspend(mode int) bool {
 }
 
 func init() {
+	outboundgroup.SmartSelectionChangedHook = func() {
+		checkGroupsChanged()
+	}
 	adapter.UrlTestHook = func(url string, name string, delay uint16) {
 		value := int32(-1)
 		if delay != 0 {

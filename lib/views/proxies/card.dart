@@ -213,6 +213,9 @@ class ProxyCard extends StatelessWidget {
   }
 
   Widget _buildFooter(BuildContext context, Widget delayText) {
+    final smartBadge = groupType == GroupType.Smart
+        ? _SmartMemberBadge(groupName: groupName, proxyName: proxy.name)
+        : null;
     if (type == ProxyCardType.expand) {
       final labelSmallHeight = measure.labelSmallHeight;
       return SizedBox(
@@ -235,7 +238,14 @@ class ProxyCard extends StatelessWidget {
                   Expanded(
                     child: Align(
                       alignment: Alignment.centerLeft,
-                      child: _ProxyMetaTag(proxy.type),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        spacing: 4,
+                        children: [
+                          Flexible(child: _ProxyMetaTag(proxy.type)),
+                          ?smartBadge,
+                        ],
+                      ),
                     ),
                   ),
                   delayText,
@@ -252,17 +262,27 @@ class ProxyCard extends StatelessWidget {
       child: Row(
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
         crossAxisAlignment: CrossAxisAlignment.center,
+        spacing: 4,
         children: [
           Flexible(
             flex: 1,
-            child: TooltipText(
-              text: Text(
-                proxy.type,
-                style: bodySmallStyle?.copyWith(
-                  overflow: TextOverflow.ellipsis,
-                  color: bodySmallStyle.color?.opacity80,
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              spacing: 4,
+              children: [
+                Flexible(
+                  child: TooltipText(
+                    text: Text(
+                      proxy.type,
+                      style: bodySmallStyle?.copyWith(
+                        overflow: TextOverflow.ellipsis,
+                        color: bodySmallStyle.color?.opacity80,
+                      ),
+                    ),
+                  ),
                 ),
-              ),
+                ?smartBadge,
+              ],
             ),
           ),
           delayText,
@@ -412,6 +432,65 @@ class _ProxyMetaTag extends StatelessWidget {
         height: 1,
         color: colorScheme.onSurfaceVariant.opacity80,
         fontWeight: FontWeight.w400,
+      ),
+    );
+  }
+}
+
+class _SmartMemberBadge extends ConsumerWidget {
+  final String groupName;
+  final String proxyName;
+
+  const _SmartMemberBadge({
+    required this.groupName,
+    required this.proxyName,
+  });
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final member = ref.watch(
+      groupsProvider.select(
+        (groups) => groups.getGroup(groupName)?.smart?.members[proxyName],
+      ),
+    );
+    if (member == null) return const SizedBox.shrink();
+
+    final colorScheme = context.colorScheme;
+    final String label;
+    final Color bg;
+    final Color fg;
+
+    if (member.blocked) {
+      label = member.region.isNotEmpty ? '${member.region} ×' : '×';
+      bg = colorScheme.errorContainer;
+      fg = colorScheme.onErrorContainer;
+    } else if (member.cooling) {
+      label = '!';
+      bg = colorScheme.tertiaryContainer;
+      fg = colorScheme.onTertiaryContainer;
+    } else if (member.verified) {
+      label = member.region.isNotEmpty ? member.region : '✓';
+      bg = colorScheme.primaryContainer;
+      fg = colorScheme.onPrimaryContainer;
+    } else {
+      return const SizedBox.shrink();
+    }
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
+      decoration: BoxDecoration(
+        color: bg,
+        borderRadius: BorderRadius.circular(4),
+      ),
+      child: Text(
+        label,
+        maxLines: 1,
+        style: context.textTheme.labelSmall?.copyWith(
+          fontSize: 10,
+          height: 1.1,
+          fontWeight: FontWeight.w600,
+          color: fg,
+        ),
       ),
     );
   }

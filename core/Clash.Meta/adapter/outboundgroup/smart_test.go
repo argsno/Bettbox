@@ -181,6 +181,7 @@ func newTestSmartWithProxies(proxies ...C.Proxy) *Smart {
 type fakeConn struct {
 	mu       sync.Mutex
 	readData []byte
+	readErr  error
 	written  []byte
 	closes   int
 }
@@ -188,6 +189,9 @@ type fakeConn struct {
 func (f *fakeConn) Read(b []byte) (int, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.readErr != nil {
+		return 0, f.readErr
+	}
 	if len(f.readData) == 0 {
 		return 0, io.EOF
 	}
@@ -741,7 +745,7 @@ func TestSmartConnCloseFailureSemantics(t *testing.T) {
 		}
 	})
 
-	t.Run("write then close before read", func(t *testing.T) {
+	t.Run("write then fast close before read does not falsely penalize", func(t *testing.T) {
 		s := newTestSmart()
 		conn := &fakeConn{}
 		sc := newSmartConn(conn, s, "A", metadata, time.Now(), 0).(*smartConn)
@@ -752,13 +756,50 @@ func TestSmartConnCloseFailureSemantics(t *testing.T) {
 		if err := sc.Close(); err != nil {
 			t.Fatalf("close failed: %v", err)
 		}
+		if st := s.states["A"]; st != nil && st.failStreak != 0 {
+			t.Fatalf("a fast caller cancel without read error must not fail the node, got %+v", st)
+		}
+	})
+
+	t.Run("write then close after wait before read", func(t *testing.T) {
+		s := newTestSmart()
+		conn := &fakeConn{}
+		sc := newSmartConn(conn, s, "A", metadata, time.Now(), 0).(*smartConn)
+
+		if _, err := sc.Write([]byte("GET / HTTP/1.1\r\n\r\n")); err != nil {
+			t.Fatalf("write failed: %v", err)
+		}
+		sc.firstWriteNano.Store(time.Now().Add(-smartUnansweredMinWait - 10*time.Millisecond).UnixNano())
+		if err := sc.Close(); err != nil {
+			t.Fatalf("close failed: %v", err)
+		}
 		st := s.states["A"]
 		if st == nil || st.failStreak != 1 {
-			t.Fatalf("an unanswered request must fail the node, got %+v", st)
+			t.Fatalf("an unanswered request past the wait window must fail the node, got %+v", st)
 		}
 		record := s.sites[getKey(metadata)]
 		if record == nil || record.proxies["A"] == nil || record.proxies["A"].lastFailure.IsZero() {
 			t.Fatalf("an unanswered request must record a site failure")
+		}
+	})
+
+	t.Run("write then read error then close", func(t *testing.T) {
+		s := newTestSmart()
+		conn := &fakeConn{readErr: errors.New("connection reset by peer")}
+		sc := newSmartConn(conn, s, "A", metadata, time.Now(), 0).(*smartConn)
+
+		if _, err := sc.Write([]byte("GET / HTTP/1.1\r\n\r\n")); err != nil {
+			t.Fatalf("write failed: %v", err)
+		}
+		if _, err := sc.Read(make([]byte, 4)); err == nil {
+			t.Fatalf("expected read error")
+		}
+		if err := sc.Close(); err != nil {
+			t.Fatalf("close failed: %v", err)
+		}
+		st := s.states["A"]
+		if st == nil || st.failStreak != 1 {
+			t.Fatalf("a read error after write must fail the node immediately, got %+v", st)
 		}
 	})
 
@@ -1564,7 +1605,7 @@ func TestSmartPacketConnCloseFailureSemantics(t *testing.T) {
 		}
 	})
 
-	t.Run("write then close before read", func(t *testing.T) {
+	t.Run("write then fast close before read does not falsely penalize", func(t *testing.T) {
 		s := newTestSmart()
 		pc := newSmartPacketConn(&fakePacketConn{}, s, "A", metadata, time.Now(), 0)
 
@@ -1574,9 +1615,25 @@ func TestSmartPacketConnCloseFailureSemantics(t *testing.T) {
 		if err := pc.Close(); err != nil {
 			t.Fatalf("close failed: %v", err)
 		}
+		if st := s.states["A"]; st != nil && st.failStreak != 0 {
+			t.Fatalf("a fast unidirectional UDP close must not fail the node, got %+v", st)
+		}
+	})
+
+	t.Run("write then close after wait before read", func(t *testing.T) {
+		s := newTestSmart()
+		pc := newSmartPacketConn(&fakePacketConn{}, s, "A", metadata, time.Now(), 0).(*smartPacketConn)
+
+		if _, err := pc.WriteTo([]byte("query"), nil); err != nil {
+			t.Fatalf("write failed: %v", err)
+		}
+		pc.firstWriteNano.Store(time.Now().Add(-smartUnansweredMinWait - 10*time.Millisecond).UnixNano())
+		if err := pc.Close(); err != nil {
+			t.Fatalf("close failed: %v", err)
+		}
 		st := s.states["A"]
 		if st == nil || st.failStreak != 1 {
-			t.Fatalf("an unanswered UDP session must fail the node, got %+v", st)
+			t.Fatalf("an unanswered UDP session past the wait window must fail the node, got %+v", st)
 		}
 		record := s.sites[getKey(metadata)]
 		if record == nil || record.proxies["A"] == nil || record.proxies["A"].lastFailure.IsZero() {

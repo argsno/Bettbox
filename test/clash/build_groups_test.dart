@@ -71,4 +71,43 @@ void main() {
     expect(buildGroups('{}'), isEmpty);
     expect(buildGroups('null'), isEmpty);
   });
+
+  test('parses smart group snapshot metadata', () {
+    final smartPayload = json.encode({
+      'names': ['ChatGPT-智能选择', 'US 01', 'HK 01'],
+      'types': ['Smart', 'Shadowsocks', 'Trojan'],
+      'groups': [
+        {
+          'name': 'ChatGPT-智能选择',
+          'type': 'Smart',
+          'now': 'US 01',
+          'all': [1, 2],
+          'smart': {
+            'service': 'openai',
+            'pin': 'group',
+            'probing': false,
+            'members': {
+              'US 01': {'score': 120, 'verified': true, 'region': 'US'},
+              'HK 01': {
+                'score': 40,
+                'blocked': true,
+                'region': 'HK',
+                'cooling': true,
+              },
+            },
+          },
+        },
+      ],
+    });
+    final groups = buildGroups(smartPayload);
+    expect(groups, hasLength(1));
+    final smart = groups.single.smart;
+    expect(smart, isNotNull);
+    expect(smart!.service, 'openai');
+    expect(smart.pin, 'group');
+    expect(smart.members['US 01']?.verified, isTrue);
+    expect(smart.members['US 01']?.region, 'US');
+    expect(smart.members['HK 01']?.blocked, isTrue);
+    expect(smart.members['HK 01']?.cooling, isTrue);
+  });
 }

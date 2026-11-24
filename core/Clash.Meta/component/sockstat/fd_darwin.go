@@ -2,7 +2,11 @@
 
 package sockstat
 
-import "golang.org/x/sys/unix"
+import (
+	"time"
+
+	"golang.org/x/sys/unix"
+)
 
 // sampleFD reads TCP transmission counters from a Darwin socket via
 // TCP_CONNECTION_INFO. The option is available since macOS 10.13; on older
@@ -17,5 +21,7 @@ func sampleFD(fd int) (TCPStats, bool) {
 		RetransPackets: info.Txretransmitpackets,
 		TxBytes:        info.Txbytes,
 		RetransBytes:   info.Txretransmitbytes,
+		RTT:            time.Duration(info.Srtt) * time.Millisecond,
+		RTTVar:         time.Duration(info.Rttvar) * time.Millisecond,
 	}, true
 }

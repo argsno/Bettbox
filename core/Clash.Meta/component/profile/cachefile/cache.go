@@ -23,6 +23,7 @@ var (
 	bucketETag             = []byte("etag")
 	bucketSubscriptionInfo = []byte("subscriptioninfo")
 	bucketStorage          = []byte("storage")
+	bucketSmartVerdicts    = []byte("smartverdicts")
 )
 
 // CacheFile store and update the cache file
@@ -71,6 +72,46 @@ func (c *CacheFile) SelectedMap() map[string]string {
 		return nil
 	})
 	return mapping
+}
+
+func (c *CacheFile) SmartVerdicts() map[string][]byte {
+	if c == nil || c.DB == nil {
+		return nil
+	}
+	mapping := map[string][]byte{}
+	_ = c.DB.View(func(t *bbolt.Tx) error {
+		bucket := t.Bucket(bucketSmartVerdicts)
+		if bucket == nil {
+			return nil
+		}
+		cursor := bucket.Cursor()
+		for k, v := cursor.First(); k != nil; k, v = cursor.Next() {
+			cp := make([]byte, len(v))
+			copy(cp, v)
+			mapping[string(k)] = cp
+		}
+		return nil
+	})
+	return mapping
+}
+
+func (c *CacheFile) SetSmartVerdict(key string, payload []byte) {
+	if c == nil || c.DB == nil {
+		return
+	}
+	err := c.DB.Batch(func(t *bbolt.Tx) error {
+		bucket, err := t.CreateBucketIfNotExists(bucketSmartVerdicts)
+		if err != nil {
+			return err
+		}
+		if len(payload) == 0 {
+			return bucket.Delete([]byte(key))
+		}
+		return bucket.Put([]byte(key), payload)
+	})
+	if err != nil {
+		log.Warnln("[CacheFile] write smart verdict to %s failed: %s", c.DB.Path(), err.Error())
+	}
 }
 
 func (c *CacheFile) Close() error {
