@@ -46,7 +46,7 @@ class DeveloperView extends ConsumerWidget {
             onTap: () {
               for (int i = 0; i < 100; i++) {
                 globalState.appController.addLog(
-                  Log.app('[$i]Kicking VillagerTom\'s Ass'),
+                  Log.app('[$i]Kicking VillagerTom\'s Ass for Test'),
                 );
               }
             },
