@@ -74,7 +74,7 @@ void main() {
     expect(tester.getTopLeft(find.text('open')).dx, homeLeft);
   });
 
-  testWidgets('CleanCupertinoPageRoute 推入 450ms，返回 360ms', (tester) async {
+  testWidgets('CleanCupertinoPageRoute 推入 450ms，返回 450ms', (tester) async {
     Route<dynamic>? pushedRoute;
     await tester.pumpWidget(
       MaterialApp(
@@ -104,7 +104,7 @@ void main() {
       expect(pageRoute.transitionDuration, const Duration(milliseconds: 450));
       expect(
         pageRoute.reverseTransitionDuration,
-        const Duration(milliseconds: 360),
+        const Duration(milliseconds: 450),
       );
     }
   });

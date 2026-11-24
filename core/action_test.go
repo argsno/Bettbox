@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -50,8 +51,21 @@ func TestActionResultJson(t *testing.T) {
 			if header.Raw != c.raw {
 				t.Fatalf("raw = %v, want %v", header.Raw, c.raw)
 			}
-			if payload != c.payload {
-				t.Fatalf("payload = %q, want %q", payload, c.payload)
+			if header.Raw {
+				if payload != c.payload {
+					t.Fatalf("payload = %q, want %q", payload, c.payload)
+				}
+				return
+			}
+			var got, want any
+			if err := json.Unmarshal([]byte(payload), &got); err != nil {
+				t.Fatalf("payload is not valid JSON: %q: %v", payload, err)
+			}
+			if err := json.Unmarshal([]byte(c.payload), &want); err != nil {
+				t.Fatalf("expected payload is not valid JSON: %q: %v", c.payload, err)
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("payload = %q (%#v), want %q (%#v)", payload, got, c.payload, want)
 			}
 		})
 	}
